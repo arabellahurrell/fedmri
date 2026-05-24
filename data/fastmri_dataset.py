@@ -8,7 +8,7 @@ from typing import Dict, Literal, Optional, Callable, List, Tuple
 import fastmri
 from fastmri.data import transforms as T
 from fastmri.data.subsample import RandomMaskFunc
-
+import xml.etree.ElementTree as ET
 
     # Single-coil knee FastMRI dataset.
 
@@ -18,11 +18,44 @@ from fastmri.data.subsample import RandomMaskFunc
     #   'kspace'       (domain='kspace'): (2, H, W) masked k-space
     #   'mask'                          : (1, 1, W) undersampling mask
     #   'fname', 'slice_idx'
+#     Four scanner groups found in FastMRI knee:
+#   hospital_A — Siemens Aera
+#   hospital_B — Siemens Skyra
+#   hospital_C — Siemens Biograph_mMR
+#   hospital_D — Siemens Prisma_fit
 
 
 def build_mask_func(acceleration: int = 4, center_fractions: float = 0.08) -> RandomMaskFunc:
     return RandomMaskFunc(center_fractions=[center_fractions], accelerations=[acceleration])
 
+def extract_volume_metadata(h5_path: Path) -> dict:
+    #gets the metadata from the ismrmrd header of the h5 file, which contains information about the acquisition, scanner model and field strength. It returns a dict with these values.
+    with h5py.File(h5_path, "r") as f:
+        acquisition = str(f.attrs.get("acquisition", "unknown"))
+        hdr_bytes = f["ismrmrd_header"][()]
+
+    hdr_xml = hdr_bytes.decode() if isinstance(hdr_bytes, bytes) else hdr_bytes
+    root = ET.fromstring(hdr_xml)
+
+    def find_text(tag):
+        el = root.find(f".//{{{root.tag.split('}')[0].lstrip('{')}}}{tag}")
+        if el is None:
+            el = root.find(f".//{tag}")
+        return el.text.strip() if el is not None and el.text else "unknown"
+
+    return {
+        "acquisition":    acquisition,
+        "scanner_model":  find_text("systemModel"),
+        "field_strength": find_text("systemFieldStrength_T"),
+    }
+
+
+SCANNER_TO_CLIENT = {
+    "Aera":         "hospital_A",
+    "Skyra":        "hospital_B",
+    "Biograph_mMR": "hospital_C",
+    "Prisma_fit":   "hospital_D",
+}
 
 class FastMRISliceDataset(Dataset):
 
@@ -56,6 +89,9 @@ class FastMRISliceDataset(Dataset):
         for h5_path in sorted(split_dir.glob("*.h5")):
             with h5py.File(h5_path, "r") as f:
                 num_slices = f["kspace"].shape[0]
+            meta = extract_volume_metadata(h5_path)
+            meta["client"] = SCANNER_TO_CLIENT.get(meta["scanner_model"], "hospital_unknown")
+            self.volume_meta[h5_path.stem] = meta
             n = num_slices if max_slices_per_volume is None else min(num_slices, max_slices_per_volume)
             self.samples.extend((h5_path, i) for i in range(n))
 
