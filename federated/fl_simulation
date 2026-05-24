@@ -1,0 +1,209 @@
+# using flwr
+import copy
+from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+import flwr as fl
+from flwr.common import (
+    FitRes, Parameters, Scalar, NDArrays,
+    ndarrays_to_parameters, parameters_to_ndarrays,
+)
+from flwr.server.strategy import FedAvg
+from flwr.server.client_proxy import ClientProxy
+
+from models.unet import UNet, ReconstructionLoss
+from models.modfed import ModFed
+from evaluation.metrics import compute_metrics
+
+
+MODEL_DOMAINS = {
+    "unet":   "image",
+    "modfed": "kspace",
+}
+
+
+def make_model(model_type: str, model_kwargs: Optional[dict] = None) -> nn.Module:
+    kwargs = model_kwargs or {}
+    if model_type == "unet":
+        return UNet(in_channels=2, out_channels=1, **kwargs)
+    if model_type == "modfed":
+        return ModFed(**kwargs)
+    raise ValueError(f"Unknown model_type: {model_type!r}")
+
+
+def get_parameters(model: nn.Module) -> NDArrays:
+    return [val.cpu().numpy() for val in model.state_dict().values()]
+
+
+def set_parameters(model: nn.Module, parameters: NDArrays) -> None:
+    state_dict = OrderedDict(
+        {k: torch.tensor(v) for k, v in zip(model.state_dict().keys(), parameters)}
+    )
+    model.load_state_dict(state_dict, strict=True)
+
+
+class Adversary:
+    def __init__(self, target_client_id: str, attack_module=None):
+        self.target_client_id = target_client_id
+        self.attack_module = attack_module
+        self.intercepted_updates: List[dict] = []
+
+    def intercept(self, client_id, parameters_before, parameters_after, batch_sample=None):
+        if client_id != self.target_client_id:
+            return
+        deltas = [(b - a).copy() for b, a in zip(parameters_before, parameters_after)]
+        entry = {"client_id": client_id, "weight_delta": deltas, "batch_sample": batch_sample}
+        self.intercepted_updates.append(entry)
+        if self.attack_module is not None:
+            self.attack_module.attack(entry)
+
+    @property
+    def last_update(self):
+        return self.intercepted_updates[-1] if self.intercepted_updates else None
+
+
+class FedMRIClient(fl.client.NumPyClient):
+    def __init__(
+        self,
+        client_id: str,
+        model: nn.Module,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        domain: str,
+        local_epochs: int = 2,
+        lr: float = 1e-3,
+        device: Optional[torch.device] = None,
+        adversary: Optional[Adversary] = None,
+    ):
+        self.client_id = client_id
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.domain = domain
+        self.local_epochs = local_epochs
+        self.lr = lr
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.adversary = adversary
+        self.loss_fn = ReconstructionLoss()
+        self.model.to(self.device)
+
+    def get_parameters(self, config):
+        return get_parameters(self.model)
+
+    def fit(self, parameters, config):
+        set_parameters(self.model, parameters)
+        params_before = get_parameters(self.model)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
+        train_loss = self._train(optimizer)
+        params_after = get_parameters(self.model)
+        if self.adversary is not None:
+            batch_sample = next(iter(self.train_loader))
+            self.adversary.intercept(self.client_id, params_before, params_after, batch_sample)
+        return params_after, len(self.train_loader.dataset), {"train_loss": float(train_loss)}
+
+    def evaluate(self, parameters, config):
+        set_parameters(self.model, parameters)
+        loss, metrics = self._evaluate()
+        return float(loss), len(self.val_loader.dataset), metrics
+
+    def _forward(self, batch):
+        if self.domain == "image":
+            x = batch["image_input"].to(self.device)
+            y = batch["image_target"].to(self.device)
+            pred = self.model(x)
+        else:
+            k = batch["kspace"].to(self.device)
+            mask = batch["mask"].to(self.device)
+            y = batch["image_target"].to(self.device)
+            pred = self.model(k, mask)
+        return pred.squeeze(1), y
+
+    def _train(self, optimizer):
+        self.model.train()
+        total_loss = 0.0
+        for _ in range(self.local_epochs):
+            for batch in self.train_loader:
+                optimizer.zero_grad()
+                pred, y = self._forward(batch)
+                loss = self.loss_fn(pred, y)
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                optimizer.step()
+                total_loss += loss.item()
+        return total_loss / (self.local_epochs * max(len(self.train_loader), 1))
+
+    def _evaluate(self):
+        self.model.eval()
+        total_loss, all_ssim, all_psnr = 0.0, [], []
+        with torch.no_grad():
+            for batch in self.val_loader:
+                pred, y = self._forward(batch)
+                total_loss += self.loss_fn(pred, y).item()
+                m = compute_metrics(pred, y)
+                all_ssim.append(m["ssim"])
+                all_psnr.append(m["psnr"])
+        n = max(len(self.val_loader), 1)
+        return total_loss / n, {"ssim": float(np.mean(all_ssim)), "psnr": float(np.mean(all_psnr))}
+
+
+class FedAvgWithLogging(FedAvg):
+    def aggregate_fit(self, server_round, results, failures):
+        aggregated_params, aggregated_metrics = super().aggregate_fit(
+            server_round, results, failures
+        )
+        if results:
+            avg_loss = np.mean([r.metrics.get("train_loss", 0.0) for _, r in results])
+            print(f"[Round {server_round}] avg train loss: {avg_loss:.4f}")
+        return aggregated_params, aggregated_metrics
+
+
+def run_simulation(
+    model_type: str,
+    train_loaders: List[DataLoader],
+    num_rounds: int = 20,
+    local_epochs: int = 2,
+    lr: float = 1e-3,
+    adversary: Optional[Adversary] = None,
+    device: Optional[torch.device] = None,
+    model_kwargs: Optional[dict] = None,
+) -> Tuple[nn.Module, object]:
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    domain = MODEL_DOMAINS[model_type]
+    model_kwargs = model_kwargs or {}
+    num_clients = len(train_loaders)
+    global_model = make_model(model_type, model_kwargs)
+
+    def client_fn(cid: str) -> FedMRIClient:
+        idx = int(cid)
+        return FedMRIClient(
+            client_id=cid,
+            model=make_model(model_type, model_kwargs),
+            train_loader=train_loaders[idx],
+            val_loader=val_loader,
+            domain=domain,
+            local_epochs=local_epochs,
+            lr=lr,
+            device=device,
+            adversary=adversary if (adversary and adversary.target_client_id == cid) else None,
+        )
+
+    strategy = FedAvgWithLogging(
+        min_fit_clients=num_clients,
+        min_evaluate_clients=num_clients,
+        min_available_clients=num_clients,
+        initial_parameters=ndarrays_to_parameters(get_parameters(global_model)),
+    )
+
+    history = fl.simulation.start_simulation(
+        client_fn=client_fn,
+        num_clients=num_clients,
+        config=fl.server.ServerConfig(num_rounds=num_rounds),
+        strategy=strategy,
+    )
+
+    return global_model, history
