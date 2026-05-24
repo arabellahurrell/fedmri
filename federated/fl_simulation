@@ -18,12 +18,14 @@ from flwr.server.client_proxy import ClientProxy
 
 from models.unet import UNet, ReconstructionLoss
 from models.modfed import ModFed
+from models.kspace_unet import KSpaceUNet
 from evaluation.metrics import compute_metrics
 
 
 MODEL_DOMAINS = {
     "unet":   "image",
     "modfed": "kspace",
+    "kspace_unet": "kspace",
 }
 
 
@@ -33,6 +35,8 @@ def make_model(model_type: str, model_kwargs: Optional[dict] = None) -> nn.Modul
         return UNet(in_channels=2, out_channels=1, **kwargs)
     if model_type == "modfed":
         return ModFed(**kwargs)
+    if model_type == "kspace_unet":
+        return KSpaceUNet(**kwargs)
     raise ValueError(f"Unknown model_type: {model_type!r}")
 
 
