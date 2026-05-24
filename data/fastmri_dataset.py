@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Dict, Literal, Optional, Callable, List, Tuple
 import fastmri
 from fastmri.data import transforms as T
-from fastmri.data.subsample import RandomMaskFunc
+from fastmri.data.subsample import RandomMaskFunc, EquispacedMaskFractionFunc
 import xml.etree.ElementTree as ET
+import json
 
     # Single-coil knee FastMRI dataset.
 
@@ -34,12 +35,12 @@ def center_crop(tensor: torch.Tensor, crop_h: int, crop_w: int) -> torch.Tensor:
 
 
 
-def build_mask_func(acceleration: int = 4, center_fractions: float = 0.08, mask_type: Literal["random", "equispaced"]] = "random",) -> RandomMaskFunc:
+def build_mask_func(acceleration: int = 4, center_fractions: float = 0.08, mask_type: Literal["random", "equispaced"] = "random",) -> RandomMaskFunc:
     cf = [center_fractions]
     acc = [acceleration]
     if mask_type == "random":
         return RandomMaskFunc(center_fractions=[center_fractions], accelerations=[acceleration])
-    return EquispacedMaskFunc(center_fractions=cf, accelerations=acc)
+    return EquispacedMaskFractionFunc(center_fractions=cf, accelerations=acc)
 
 def extract_volume_metadata(h5_path: Path) -> dict:
     #gets the metadata from the ismrmrd header of the h5 file, which contains information about the acquisition, scanner model and field strength. It returns a dict with these values.
@@ -70,6 +71,41 @@ SCANNER_TO_CLIENT = {
     "Prisma_fit":   "hospital_D",
 }
 
+def load_or_build_slice_cache(
+    split_dir: Path,
+    cache_path: Optional[Path] = None,
+) -> Dict[str, int]:
+    """
+    Return {filename_stem: num_slices} for every h5 in split_dir.
+
+    If cache_path exists it is loaded instantly (avoids opening every file).
+    Otherwise we scan all files and save the result to cache_path.
+    """
+    if cache_path is not None and cache_path.exists():
+        with open(cache_path) as f:
+            return json.load(f)
+
+    print(f"  Building slice cache for {split_dir.name} — this is a one-time scan...")
+    cache: Dict[str, int] = {}
+    files = sorted(split_dir.glob("*.h5"))
+    for i, h5_path in enumerate(files):
+        if i % 50 == 0:
+            print(f"    {i}/{len(files)} volumes scanned...", flush=True)
+        try:
+            with h5py.File(h5_path, "r") as f:
+                cache[h5_path.stem] = int(f["kspace"].shape[0])
+        except Exception as e:
+            print(f"    Warning: could not read {h5_path.name}: {e}")
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(cache, f)
+        print(f"  Slice cache saved to {cache_path}")
+
+    return cache
+
+
 class FastMRISliceDataset(Dataset):
 
     def __init__(
@@ -81,7 +117,9 @@ class FastMRISliceDataset(Dataset):
         center_fractions: float = 0.08,
         max_slices_per_volume: Optional[int] = None,
         transform: Optional[Callable] = None,
+        crop_size: Optional[Tuple[int, int]] = None,
         seed: int = 42,
+        cache_dir: Optional[str] = None, 
     ):
         self.root = Path(root)
         self.domain = domain
@@ -90,6 +128,7 @@ class FastMRISliceDataset(Dataset):
         self.mask_func = build_mask_func(acceleration, center_fractions)
         self.transform = transform
         self.rng = np.random.RandomState(seed)
+        self.crop_size = crop_size
 
         split_dir = self.root / f"knee_singlecoil_{split}"
         if not split_dir.exists():
@@ -97,19 +136,42 @@ class FastMRISliceDataset(Dataset):
                 f"FastMRI split directory not found: {split_dir}\n"
                 "Please download from https://fastmri.med.nyu.edu/ and extract to data/fastmri/"
             )
+        
+        cache_path = None
+        if cache_dir is not None:
+            cache_path = Path(cache_dir) / f"slice_counts_{split}.json"
+        slice_cache = load_or_build_slice_cache(split_dir, cache_path)
+
 
         self.samples: List[Tuple[Path, int]] = []
         self.volume_meta: Dict[str, dict] = {}
 
         for h5_path in sorted(split_dir.glob("*.h5")):
-            with h5py.File(h5_path, "r") as f:
-                num_slices = f["kspace"].shape[0]
-                rss = f["reconstruction_rss"][()]
+            stem = h5_path.stem
+            if stem in slice_cache:
+                num_slices = slice_cache[stem]
+            else:
+                try:
+                    with h5py.File(h5_path, "r") as f:
+                        num_slices = int(f["kspace"].shape[0])
+                except Exception as e:
+                    print(f"  Skipping {h5_path.name}: {e}")
+                    continue
+            try:
+                with h5py.File(h5_path, "r") as f:
+                    # num_slices = f["kspace"].shape[0]
+                    rss = f["reconstruction_rss"][()]
                 norm_scale = float(np.percentile(np.abs(rss), 95)) or 1.0
-            meta = extract_volume_metadata(h5_path)
+            except Exception as e:
+                norm_scale = 1.0
+            
+            try:
+                meta = extract_volume_metadata(h5_path)
+            except Exception as e:
+                meta = {"acquisition": "unknown", "scanner_model": "unknown", "field_strength": "unknown"}
             meta["client"] = SCANNER_TO_CLIENT.get(meta["scanner_model"], "hospital_unknown")
             meta["norm_scale"] = norm_scale
-            self.volume_meta[h5_path.stem] = meta
+            self.volume_meta[stem] = meta
             n = num_slices if max_slices_per_volume is None else min(num_slices, max_slices_per_volume)
             self.samples.extend((h5_path, i) for i in range(n))
 
@@ -137,7 +199,7 @@ class FastMRISliceDataset(Dataset):
         kspace_masked = kspace_masked / norm_scale
 
         # Ground truth from fully sampled k-space
-        image_gt = fastmri.ifft2c(torch.view_as_real(kspace).unsqueeze(0))
+        image_gt = fastmri.ifft2c(torch.view_as_real(kspace).contiguous().unsqueeze(0))
         image_gt_rss = fastmri.rss(fastmri.complex_abs(image_gt), dim=0)
 
         if self.crop_size is not None:
@@ -145,7 +207,7 @@ class FastMRISliceDataset(Dataset):
             image_gt_rss = center_crop(image_gt_rss, ch, cw)
 
         if self.domain == "image":
-            zf_complex = fastmri.ifft2c(torch.view_as_real(kspace_masked).unsqueeze(0))
+            zf_complex = fastmri.ifft2c(torch.view_as_real(kspace_masked).contiguous().unsqueeze(0))
             image_input = zf_complex.squeeze(0).permute(2, 0, 1)
             sample = {
                 "image_input": image_input.contiguous().clone(),
