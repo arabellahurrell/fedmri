@@ -4,6 +4,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from models.kspace_unet import KSpaceUNet
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -14,10 +15,32 @@ from models.unet import UNet, ReconstructionLoss
 from models.modfed import ModFed
 from evaluation.metrics import evaluate_model, ResultsTracker
 
+def pad_to_max(batch):
+    """Pad spatial dims to the largest H×W in the batch, then stack."""
+    keys = batch[0].keys()
+    result = {}
+    for key in keys:
+        vals = [item[key] for item in batch]
+        if not isinstance(vals[0], torch.Tensor):
+            result[key] = vals
+            continue
+        if vals[0].dim() >= 2:
+            max_h = max(v.shape[-2] for v in vals)
+            max_w = max(v.shape[-1] for v in vals)
+            padded = []
+            for v in vals:
+                dh = max_h - v.shape[-2]
+                dw = max_w - v.shape[-1]
+                v = F.pad(v, (0, dw, 0, dh))
+                padded.append(v)
+            result[key] = torch.stack(padded, dim=0)
+        else:
+            result[key] = torch.stack(vals, dim=0)
+    return result
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Baseline MRI reconstruction training")
-    parser.add_argument("--model",       choices=["unet", "modfed"], default="unet")
+    parser.add_argument("--model",       choices=["unet", "modfed", "kspace_unet"], default="unet")
     parser.add_argument("--domain",      choices=["image", "kspace"], default="image")
     parser.add_argument("--data_root",   default="data/fastmri")
     parser.add_argument("--epochs",      type=int, default=20)
@@ -46,6 +69,7 @@ def main():
         root=args.data_root,
         domain=args.domain,
         split="train",
+        acceleration=args.acceleration,
         seed=args.seed,
     )
     val_ds = FastMRISliceDataset(
@@ -55,18 +79,23 @@ def main():
         acceleration=args.acceleration,
         seed=args.seed,
     )
+
+    pin_memory = device.type == "cuda"
+
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True,
+        num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=pad_to_max,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
+        num_workers=args.num_workers, pin_memory=pin_memory, collate_fn=pad_to_max,
     )
     print(f"Train slices: {len(train_ds)} | Val slices: {len(val_ds)}")
 
     if args.model == "unet":
         model = UNet(in_channels=2, out_channels=1, base_features=32, depth=4)
+    elif args.model == "kspace_unet":
+        model = KSpaceUNet(base_features=32, depth=4)
     else:
         model = ModFed(num_cascades=6, kspace_ch=64, kspace_layers=5)
 

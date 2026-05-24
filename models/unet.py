@@ -67,10 +67,10 @@ class UNet(nn.Module):
             [Down(features[i], features[i + 1], dropout) for i in range(depth)]
         )
 
-        self.ups = nn.ModuleList(
-            [Up(features[i] * 2, features[i - 1] if i > 0 else features[0], dropout)
-             for i in range(depth, 0, -1)]
-        )
+        self.ups = nn.ModuleList()
+        for i in range(depth - 1, -1, -1):
+            self.ups.append(Up(features[i + 1] + features[i], features[i], dropout))
+
 
         self.outc = nn.Conv2d(features[0], out_channels, kernel_size=1)
 
@@ -100,6 +100,8 @@ class ReconstructionLoss(nn.Module):
         ssim_val = ssim(pred, target)
         return self.lambda1 * l1 + self.lambda2 * (1.0 - ssim_val)
 
+#make it so that it isnt recreated ever call
+_SSIM_KERNEL: dict = {}
 
 def ssim(
     pred: torch.Tensor,
@@ -112,10 +114,13 @@ def ssim(
     C2 = (0.03 * data_range) ** 2
     pad = window_size // 2
 
-    # Kernel recreated every call
-    kernel = torch.ones(
-        1, 1, window_size, window_size, device=pred.device
-    ) / (window_size ** 2)
+    key = (window_size, pred.device)
+    if key not in _SSIM_KERNEL:
+        _SSIM_KERNEL[key] = torch.ones(
+            1, 1, window_size, window_size, device=pred.device
+        ) / (window_size ** 2)
+    kernel = _SSIM_KERNEL[key]
+
 
     mu_x = F.conv2d(pred, kernel, padding=pad, groups=1)
     mu_y = F.conv2d(target, kernel, padding=pad, groups=1)

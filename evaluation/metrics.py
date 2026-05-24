@@ -89,16 +89,21 @@ def evaluate_model(
     model.eval()
     all_ssim, all_psnr, all_nmse, all_lpips, all_loss = [], [], [], [], []
 
+    uses_mask = domain != "image" and not model.__class__.__name__ == "KSpaceUNet"
     for batch in loader:
         if domain == "image":
             x = batch["image_input"].to(device)
             y = batch["image_target"].to(device)
             pred = model(x).squeeze(1)
-        else:
+        elif uses_mask:
             k = batch["kspace"].to(device)
             mask = batch["mask"].to(device)
             y = batch["image_target"].to(device)
             pred = model(k, mask).squeeze(1)
+        else:
+            k = batch["kspace"].to(device)
+            y = batch["image_target"].to(device)
+            pred = model(k).squeeze(1)
 
         all_loss.append(loss_fn(pred, y).item())
         m = compute_metrics(pred, y)
@@ -155,8 +160,9 @@ class ResultsTracker:
 
     def plot_training_curves(self, metric="ssim", save=True, filename="training_curves.png"):
         df = self.to_dataframe()
-        if "round" not in df.columns:
-            raise ValueError("Records must contain 'round' column.")
+        x_col = "round" if "round" in df.columns else "epoch" if "epoch" in df.columns else None
+        if x_col is None:
+            raise ValueError("Records must contain 'round' or 'epoch' column.")
 
         fig, ax = plt.subplots(figsize=(8, 5))
         for label, grp in df.groupby(["model", "domain"]):

@@ -120,11 +120,19 @@ class FedMRIClient(fl.client.NumPyClient):
             x = batch["image_input"].to(self.device)
             y = batch["image_target"].to(self.device)
             pred = self.model(x)
-        else:
+        elif self.domain == "kspace":
             k = batch["kspace"].to(self.device)
-            mask = batch["mask"].to(self.device)
             y = batch["image_target"].to(self.device)
-            pred = self.model(k, mask)
+            if hasattr(self.model, "forward") and "mask" in batch:
+                try:
+                    mask = batch["mask"].to(self.device)
+                    pred = self.model(k, mask)
+                except TypeError:
+                    pred = self.model(k)
+            else:
+                pred = self.model(k)
+        else:
+            raise ValueError(f"Unknown domain: {self.domain!r}")
         return pred.squeeze(1), y
 
     def _train(self, optimizer):
@@ -168,7 +176,7 @@ class FedAvgWithLogging(FedAvg):
 
 def run_simulation(
     model_type: str,
-    train_loaders: List[DataLoader],
+    train_loaders: Dict[str, DataLoader],
     num_rounds: int = 20,
     local_epochs: int = 2,
     lr: float = 1e-3,
@@ -179,13 +187,14 @@ def run_simulation(
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     domain = MODEL_DOMAINS[model_type]
     model_kwargs = model_kwargs or {}
+    client_ids = list(train_loaders.keys())
     num_clients = len(train_loaders)
     global_model = make_model(model_type, model_kwargs)
 
     def client_fn(cid: str) -> FedMRIClient:
-        idx = int(cid)
+        idx = client_ids[int(cid)]
         return FedMRIClient(
-            client_id=cid,
+            client_id=idx,
             model=make_model(model_type, model_kwargs),
             train_loader=train_loaders[idx],
             val_loader=val_loader,
