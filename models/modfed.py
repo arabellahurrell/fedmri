@@ -47,6 +47,16 @@ class DataConsistency(nn.Module):
         mask: torch.Tensor,         # (B, 1, 1, W) or (B, 1, H, W) bool
     ) -> torch.Tensor:
         m = mask.float()
+        while m.dim() > k_predicted.dim():
+            m = m.squeeze(2)
+        # Crop H and W if mask was built for full-res but k is center-cropped
+        for spatial_dim in [-2, -1]:
+            size = m.shape[spatial_dim]
+            target = k_predicted.shape[spatial_dim]
+            if size > 1 and size != target:
+                start = (size - target) // 2
+                m = m.narrow(m.dim() + spatial_dim, start, target)
+
         if m.shape[1] == 1:
             m = m.expand_as(k_predicted)
 
