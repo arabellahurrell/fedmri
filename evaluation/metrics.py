@@ -6,6 +6,30 @@ from skimage.metrics import structural_similarity, peak_signal_noise_ratio
 import pandas as pd
 import matplotlib.pyplot as plt
 
+try:
+    import lpips as lpips_lib
+    _lpips_fn = lpips_lib.LPIPS(net="vgg", verbose=False)
+    _lpips_fn.eval()
+    _LPIPS_AVAILABLE = True
+except ImportError:
+    _lpips_fn = None
+    _LPIPS_AVAILABLE = False
+
+    def _lpips_batch(pred_np: np.ndarray, target_np: np.ndarray, device: torch.device) -> float:
+        if not _LPIPS_AVAILABLE:
+            return float("nan")
+
+        def to_rgb(arr):
+            t = torch.from_numpy(arr).float()
+            t = t.unsqueeze(1).expand(-1, 3, -1, -1)
+            return t * 2.0 - 1.0
+
+        p = to_rgb(pred_np).to(device)
+        t = to_rgb(target_np).to(device)
+        fn = _lpips_fn.to(device)
+        with torch.no_grad():
+            scores = fn(p, t)
+        return float(scores.mean().item())
 
 def compute_metrics(
     pred: torch.Tensor,
@@ -20,6 +44,7 @@ def compute_metrics(
         target_np = target_np[np.newaxis]
 
     ssim_scores, psnr_scores, nmse_scores = [], [], []
+    pred_norm_batch, target_norm_batch = [], []
 
     for p, t in zip(pred_np, target_np):
         t_min, t_max = t.min(), t.max()
@@ -33,11 +58,21 @@ def compute_metrics(
         ssim_scores.append(structural_similarity(t_n, p_n, data_range=1.0))
         psnr_scores.append(peak_signal_noise_ratio(t_n, p_n, data_range=1.0))
         nmse_scores.append(float(np.sum((t_n - p_n) ** 2) / (np.sum(t_n ** 2) + 1e-8)))
+        pred_norm_batch.append(p_n)
+        target_norm_batch.append(t_n)
+
+    device = pred.device if isinstance(pred, torch.Tensor) else torch.device("cpu")
+    lpips_score = _lpips_batch(
+        np.stack(pred_norm_batch),
+        np.stack(target_norm_batch),
+        device,
+    )
 
     return {
         "ssim": float(np.mean(ssim_scores)),
         "psnr": float(np.mean(psnr_scores)),
         "nmse": float(np.mean(nmse_scores)),
+        "lpips": lpips_score,
     }
 
 
@@ -52,7 +87,7 @@ def evaluate_model(
     loss_fn = ReconstructionLoss()
 
     model.eval()
-    all_ssim, all_psnr, all_nmse, all_loss = [], [], [], []
+    all_ssim, all_psnr, all_nmse, all_lpips, all_loss = [], [], [], [], []
 
     for batch in loader:
         if domain == "image":
@@ -70,12 +105,14 @@ def evaluate_model(
         all_ssim.append(m["ssim"])
         all_psnr.append(m["psnr"])
         all_nmse.append(m["nmse"])
+        all_lpips.append(m["lpips"])
 
     return {
         "loss": float(np.mean(all_loss)),
         "ssim": float(np.mean(all_ssim)),
         "psnr": float(np.mean(all_psnr)),
         "nmse": float(np.mean(all_nmse)),
+        "lpips": float(np.nanmean(all_lpips)),
     }
 
 
@@ -126,7 +163,7 @@ class ResultsTracker:
             grp_sorted = grp.sort_values("round")
             ax.plot(grp_sorted["round"], grp_sorted[metric],
                     marker=".", label=f"{label[0]} ({label[1]})")
-        ax.set_xlabel("Round")
+        ax.set_xlabel("Round / Epoch")
         ax.set_ylabel(metric.upper())
         ax.set_title(f"Training — {metric.upper()}")
         ax.legend()

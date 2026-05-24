@@ -2,7 +2,7 @@ import os
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from pathlib import Path
 from typing import Dict, Literal, Optional, Callable, List, Tuple
 import fastmri
@@ -24,9 +24,22 @@ import xml.etree.ElementTree as ET
 #   hospital_C — Siemens Biograph_mMR
 #   hospital_D — Siemens Prisma_fit
 
+def center_crop(tensor: torch.Tensor, crop_h: int, crop_w: int) -> torch.Tensor:
+    #center crop the last two spatial dims of a tensor.
+    h, w = tensor.shape[-2], tensor.shape[-1]
+    top  = max((h - crop_h) // 2, 0)
+    left = max((w - crop_w) // 2, 0)
+    return tensor[..., top:top + min(crop_h, h), left:left + min(crop_w, w)]
 
-def build_mask_func(acceleration: int = 4, center_fractions: float = 0.08) -> RandomMaskFunc:
-    return RandomMaskFunc(center_fractions=[center_fractions], accelerations=[acceleration])
+
+
+
+def build_mask_func(acceleration: int = 4, center_fractions: float = 0.08, mask_type: Literal["random", "equispaced"]] = "random",) -> RandomMaskFunc:
+    cf = [center_fractions]
+    acc = [acceleration]
+    if mask_type == "random":
+        return RandomMaskFunc(center_fractions=[center_fractions], accelerations=[acceleration])
+    return EquispacedMaskFunc(center_fractions=cf, accelerations=acc)
 
 def extract_volume_metadata(h5_path: Path) -> dict:
     #gets the metadata from the ismrmrd header of the h5 file, which contains information about the acquisition, scanner model and field strength. It returns a dict with these values.
@@ -86,11 +99,16 @@ class FastMRISliceDataset(Dataset):
             )
 
         self.samples: List[Tuple[Path, int]] = []
+        self.volume_meta: Dict[str, dict] = {}
+
         for h5_path in sorted(split_dir.glob("*.h5")):
             with h5py.File(h5_path, "r") as f:
                 num_slices = f["kspace"].shape[0]
+                rss = f["reconstruction_rss"][()]
+                norm_scale = float(np.percentile(np.abs(rss), 95)) or 1.0
             meta = extract_volume_metadata(h5_path)
             meta["client"] = SCANNER_TO_CLIENT.get(meta["scanner_model"], "hospital_unknown")
+            meta["norm_scale"] = norm_scale
             self.volume_meta[h5_path.stem] = meta
             n = num_slices if max_slices_per_volume is None else min(num_slices, max_slices_per_volume)
             self.samples.extend((h5_path, i) for i in range(n))
@@ -100,16 +118,13 @@ class FastMRISliceDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         fpath, slice_idx = self.samples[idx]
+        meta = self.volume_meta[fpath.stem]
+        norm_scale = meta["norm_scale"]
 
         with h5py.File(fpath, "r") as f:
             kspace_np = f["kspace"][slice_idx]
 
         kspace = torch.from_numpy(kspace_np.astype(np.complex64))
-
-        # Simple global normalisation by max magnitude
-        norm = kspace.abs().max()
-        if norm > 0:
-            kspace = kspace / norm
 
         kspace_t, mask, _ = T.apply_mask(
             kspace.unsqueeze(0).unsqueeze(0),
@@ -118,30 +133,51 @@ class FastMRISliceDataset(Dataset):
         )
         kspace_masked = kspace_t.squeeze(0).squeeze(0)
 
+        kspace = kspace / norm_scale
+        kspace_masked = kspace_masked / norm_scale
+
         # Ground truth from fully sampled k-space
         image_gt = fastmri.ifft2c(torch.view_as_real(kspace).unsqueeze(0))
         image_gt_rss = fastmri.rss(fastmri.complex_abs(image_gt), dim=0)
+
+        if self.crop_size is not None:
+            ch, cw = self.crop_size
+            image_gt_rss = center_crop(image_gt_rss, ch, cw)
 
         if self.domain == "image":
             zf_complex = fastmri.ifft2c(torch.view_as_real(kspace_masked).unsqueeze(0))
             image_input = zf_complex.squeeze(0).permute(2, 0, 1)
             sample = {
-                "image_input": image_input,
-                "image_target": image_gt_rss,
-                "mask": mask,
+                "image_input": image_input.contiguous().clone(),
+                "image_target": image_gt_rss.contiguous().clone(),
+                "mask": mask.contiguous().clone(),
                 "fname": str(fpath.name),
                 "slice_idx": slice_idx,
+                "acquisition": meta["acquisition"],
+                "scanner_model": meta["scanner_model"],
+                "client": meta["client"],
+                "norm_scale": norm_scale,
             }
         else:
             ks_masked_2ch = torch.view_as_real(kspace_masked).permute(2, 0, 1)
             ks_full_2ch   = torch.view_as_real(kspace).permute(2, 0, 1)
+            
+            if self.crop_size is not None:
+                ch, cw = self.crop_size
+                ks_masked_2ch = center_crop(ks_masked_2ch, ch, cw)
+                ks_full_2ch   = center_crop(ks_full_2ch, ch, cw)
+            
             sample = {
-                "kspace": ks_masked_2ch,
-                "kspace_target": ks_full_2ch,
-                "image_target": image_gt_rss,
-                "mask": mask,
+                "kspace": ks_masked_2ch.contiguous().clone(),
+                "kspace_target": ks_full_2ch.contiguous().clone(),
+                "image_target": image_gt_rss.contiguous().clone(),
+                "mask": mask.contiguous().clone(),
                 "fname": str(fpath.name),
                 "slice_idx": slice_idx,
+                "acquisition": meta["acquisition"],
+                "scanner_model": meta["scanner_model"],
+                "client": meta["client"],
+                "norm_scale": norm_scale,
             }
 
         if self.transform is not None:
@@ -149,37 +185,79 @@ class FastMRISliceDataset(Dataset):
 
         return sample
 
+def partition_by_scanner(
+    dataset: FastMRISliceDataset,
+) -> Dict[str, List[int]]:
+    groups: Dict[str, List[int]] = {}
+    for i, (fpath, _) in enumerate(dataset.samples):
+        label = dataset.volume_meta[fpath.stem]["client"]
+        groups.setdefault(label, []).append(i)
+    return groups
+
+
+def partition_by_acquisition(
+    dataset: FastMRISliceDataset,
+) -> Dict[str, List[int]]:
+    groups: Dict[str, List[int]] = {}
+    for i, (fpath, _) in enumerate(dataset.samples):
+        label = dataset.volume_meta[fpath.stem]["acquisition"]
+        groups.setdefault(label, []).append(i)
+    return groups
+
+
+def partition_iid(
+    dataset: FastMRISliceDataset,
+    num_clients: int,
+    seed: int = 42,
+) -> Dict[str, List[int]]:
+    rng = np.random.RandomState(seed)
+    indices = np.arange(len(dataset))
+    rng.shuffle(indices)
+    splits = np.array_split(indices, num_clients)
+    return {f"client_{i}": s.tolist() for i, s in enumerate(splits)}
+
 
 def get_client_dataloaders(
     root: str,
-    domain: str = "image",
+    domain: Literal["kspace", "image"] = "image",
     acceleration: int = 4,
     batch_size: int = 4,
-    num_clients: int = 4,
+    partition: Literal["scanner", "acquisition", "iid"] = "scanner",
+    num_clients_iid: int = 4,
     num_workers: int = 4,
     pin_memory: bool = False,
     seed: int = 42,
-) -> Tuple[List[DataLoader], DataLoader]:
+) -> Tuple[Dict[str, DataLoader], DataLoader]:
     # IID split
-    from torch.utils.data import Subset
-    import numpy as np
 
     train_ds = FastMRISliceDataset(root=root, domain=domain, split="train",
                                    acceleration=acceleration, seed=seed)
     val_ds   = FastMRISliceDataset(root=root, domain=domain, split="val",
                                    acceleration=acceleration, seed=seed)
 
-    rng = np.random.RandomState(seed)
-    indices = np.arange(len(train_ds))
-    rng.shuffle(indices)
-    splits = np.array_split(indices, num_clients)
+    if partition == "scanner":
+        groups = partition_by_scanner(train_ds)
+    elif partition == "acquisition":
+        groups = partition_by_acquisition(train_ds)
+    else:
+        groups = partition_iid(train_ds, num_clients_iid, seed=seed)
 
-    train_loaders = [
-        DataLoader(Subset(train_ds, s.tolist()), batch_size=batch_size,
-                   shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
-        for s in splits
-    ]
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=pin_memory)
+    train_loaders = {
+        label: DataLoader(
+            Subset(train_ds, idxs),
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        for label, idxs in groups.items()
+    }
 
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
     return train_loaders, val_loader
