@@ -71,7 +71,7 @@ def main():
         domain=args.domain,
         split="train",
         acceleration=args.acceleration,
-        seed=args.seed,,
+        seed=args.seed,
         cache_dir=args.data_root,
     )
     val_ds = FastMRISliceDataset(
