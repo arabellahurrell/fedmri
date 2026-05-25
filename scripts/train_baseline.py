@@ -141,7 +141,10 @@ def main():
                 k = batch["kspace"].to(device)
                 mask = batch["mask"].to(device)
                 y = batch["image_target"].to(device)
-                pred = model(k, mask).squeeze(1)
+                if args.model == "modfed":
+                    pred = model(k, mask).squeeze(1)
+                else:
+                    pred = model(k).squeeze(1)
 
             loss = loss_fn(pred, y)
             loss.backward()
