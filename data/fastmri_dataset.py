@@ -74,19 +74,16 @@ SCANNER_TO_CLIENT = {
 def load_or_build_slice_cache(
     split_dir: Path,
     cache_path: Optional[Path] = None,
-) -> Dict[str, int]:
-    """
-    Return {filename_stem: num_slices} for every h5 in split_dir.
-
-    If cache_path exists it is loaded instantly (avoids opening every file).
-    Otherwise we scan all files and save the result to cache_path.
-    """
+) -> Tuple[Dict[str, int], Dict[str, float], Dict[str, dict]]:
     if cache_path is not None and cache_path.exists():
         with open(cache_path) as f:
-            return json.load(f)
+            data = json.load(f)
+        return data["slices"], data["norm_scales"], data.get("meta", {})
 
-    print(f"  Building slice cache for {split_dir.name} — this is a one-time scan...")
+    print(f"  Building volume cache for {split_dir.name} — this is a one-time scan...")
     cache: Dict[str, int] = {}
+    norm_cache: Dict[str, float] = {}
+    meta_cache: Dict[str, dict] = {}
     files = sorted(split_dir.glob("*.h5"))
     for i, h5_path in enumerate(files):
         if i % 50 == 0:
@@ -94,16 +91,21 @@ def load_or_build_slice_cache(
         try:
             with h5py.File(h5_path, "r") as f:
                 cache[h5_path.stem] = int(f["kspace"].shape[0])
+                rss = f["reconstruction_rss"][()]
+                norm_cache[h5_path.stem] = float(np.percentile(np.abs(rss), 95)) or 1.0
+            meta = extract_volume_metadata(h5_path)
+            meta_cache[h5_path.stem] = meta
         except Exception as e:
             print(f"    Warning: could not read {h5_path.name}: {e}")
+            meta_cache[h5_path.stem] = {"acquisition": "unknown", "scanner_model": "unknown", "field_strength": "unknown"}
 
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "w") as f:
-            json.dump(cache, f)
+            json.dump({"slices": cache, "norm_scales": norm_cache, "meta": meta_cache}, f)
         print(f"  Slice cache saved to {cache_path}")
 
-    return cache
+    return cache, norm_cache, meta_cache
 
 
 class FastMRISliceDataset(Dataset):
@@ -139,8 +141,8 @@ class FastMRISliceDataset(Dataset):
         
         cache_path = None
         if cache_dir is not None:
-            cache_path = Path(cache_dir) / f"slice_counts_{split}.json"
-        slice_cache = load_or_build_slice_cache(split_dir, cache_path)
+            cache_path = Path(cache_dir) / f"volume_cache_{split}.json"
+        slice_cache, norm_cache, meta_cache = load_or_build_slice_cache(split_dir, cache_path)
 
 
         self.samples: List[Tuple[Path, int]] = []
@@ -157,18 +159,16 @@ class FastMRISliceDataset(Dataset):
                 except Exception as e:
                     print(f"  Skipping {h5_path.name}: {e}")
                     continue
-            try:
-                with h5py.File(h5_path, "r") as f:
-                    # num_slices = f["kspace"].shape[0]
-                    rss = f["reconstruction_rss"][()]
-                norm_scale = float(np.percentile(np.abs(rss), 95)) or 1.0
-            except Exception as e:
-                norm_scale = 1.0
+            # try:
+            #     with h5py.File(h5_path, "r") as f:
+            #         # num_slices = f["kspace"].shape[0]
+            #         rss = f["reconstruction_rss"][()]
+            #     norm_scale = float(np.percentile(np.abs(rss), 95)) or 1.0
+            # except Exception as e:
+            #     norm_scale = 1.0
+            norm_scale = norm_cache.get(stem, 1.0)
             
-            try:
-                meta = extract_volume_metadata(h5_path)
-            except Exception as e:
-                meta = {"acquisition": "unknown", "scanner_model": "unknown", "field_strength": "unknown"}
+            meta = meta_cache.get(stem, {"acquisition": "unknown", "scanner_model": "unknown", "field_strength": "unknown"})
             meta["client"] = SCANNER_TO_CLIENT.get(meta["scanner_model"], "hospital_unknown")
             meta["norm_scale"] = norm_scale
             self.volume_meta[stem] = meta
