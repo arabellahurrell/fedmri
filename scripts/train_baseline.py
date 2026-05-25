@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import torch.nn.functional as F
 
 from data.fastmri_dataset import FastMRISliceDataset
 from models.unet import UNet, ReconstructionLoss
@@ -107,10 +108,23 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     loss_fn = ReconstructionLoss()
 
-    tracker = ResultsTracker(save_dir=args.results_dir)
     best_ssim = 0.0
 
-    for epoch in range(1, args.epochs + 1):
+    resume_path = f"{args.save_dir}/{args.model}_{args.domain}_latest.pt"
+    start_epoch = 1
+    if os.path.exists(resume_path):
+        print(f"Resuming from {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        best_ssim = ckpt["best_ssim"]
+        start_epoch = ckpt["epoch"] + 1
+        print(f"  Resumed from epoch {ckpt['epoch']} (best SSIM={best_ssim:.4f})")
+
+    tracker = ResultsTracker(save_dir=args.results_dir)
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         train_loss = 0.0
 
@@ -160,11 +174,21 @@ def main():
                 "args": vars(args),
             }, ckpt_path)
             print(f"  Saved best checkpoint (SSIM={best_ssim:.4f})")
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_ssim": best_ssim,
+            "val_metrics": val_metrics,
+            "args": vars(args),
+        }, f"{args.save_dir}/{args.model}_{args.domain}_latest.pt")
 
     tracker.save_csv(f"baseline_{args.model}_{args.domain}.csv")
     tracker.plot_training_curves(metric="val_ssim",
                                   filename=f"baseline_{args.model}_{args.domain}_ssim.png")
     print(f"\nDone. Best SSIM: {best_ssim:.4f}")
+    
 
 
 if __name__ == "__main__":
