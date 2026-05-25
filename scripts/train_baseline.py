@@ -71,7 +71,8 @@ def main():
         domain=args.domain,
         split="train",
         acceleration=args.acceleration,
-        seed=args.seed,
+        seed=args.seed,,
+        cache_dir=args.data_root,
     )
     val_ds = FastMRISliceDataset(
         root=args.data_root,
@@ -79,6 +80,7 @@ def main():
         split="val",
         acceleration=args.acceleration,
         seed=args.seed,
+        cache_dir=args.data_root,
     )
 
     pin_memory = device.type == "cuda"
