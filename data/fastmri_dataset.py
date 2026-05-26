@@ -3,6 +3,7 @@ import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
+import torch.nn.functional as F
 from pathlib import Path
 from typing import Dict, Literal, Optional, Callable, List, Tuple
 import fastmri
@@ -32,7 +33,28 @@ def center_crop(tensor: torch.Tensor, crop_h: int, crop_w: int) -> torch.Tensor:
     left = max((w - crop_w) // 2, 0)
     return tensor[..., top:top + min(crop_h, h), left:left + min(crop_w, w)]
 
-
+def pad_to_max(batch):
+    """Pad spatial dims to the largest H×W in the batch, then stack."""
+    keys = batch[0].keys()
+    result = {}
+    for key in keys:
+        vals = [item[key] for item in batch]
+        if not isinstance(vals[0], torch.Tensor):
+            result[key] = vals
+            continue
+        if vals[0].dim() >= 2:
+            max_h = max(v.shape[-2] for v in vals)
+            max_w = max(v.shape[-1] for v in vals)
+            padded = []
+            for v in vals:
+                dh = max_h - v.shape[-2]
+                dw = max_w - v.shape[-1]
+                v = F.pad(v, (0, dw, 0, dh))
+                padded.append(v)
+            result[key] = torch.stack(padded, dim=0)
+        else:
+            result[key] = torch.stack(vals, dim=0)
+    return result
 
 
 def build_mask_func(acceleration: int = 4, center_fractions: float = 0.08, mask_type: Literal["random", "equispaced"] = "random",) -> RandomMaskFunc:
@@ -289,13 +311,14 @@ def get_client_dataloaders(
     num_workers: int = 4,
     pin_memory: bool = False,
     seed: int = 42,
+    cache_dir: Optional[str] = None,
 ) -> Tuple[Dict[str, DataLoader], DataLoader]:
     # IID split
 
     train_ds = FastMRISliceDataset(root=root, domain=domain, split="train",
-                                   acceleration=acceleration, seed=seed)
+                                   acceleration=acceleration, seed=seed, cache_dir=cache_dir)
     val_ds   = FastMRISliceDataset(root=root, domain=domain, split="val",
-                                   acceleration=acceleration, seed=seed)
+                                   acceleration=acceleration, seed=seed, cache_dir=cache_dir)
 
     if partition == "scanner":
         groups = partition_by_scanner(train_ds)
@@ -311,6 +334,7 @@ def get_client_dataloaders(
             shuffle=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            collate_fn=pad_to_max,
         )
         for label, idxs in groups.items()
     }
@@ -321,5 +345,6 @@ def get_client_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        collate_fn=pad_to_max,
     )
     return train_loaders, val_loader

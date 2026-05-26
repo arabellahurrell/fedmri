@@ -5,6 +5,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 
 from data.fastmri_dataset import get_client_dataloaders
@@ -52,6 +53,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         seed=args.seed,
+        cache_dir=args.data_root,
     )
 
     adversary = Adversary(target_client_id="0")

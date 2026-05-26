@@ -177,6 +177,7 @@ class FedAvgWithLogging(FedAvg):
 def run_simulation(
     model_type: str,
     train_loaders: Dict[str, DataLoader],
+    val_loader: DataLoader,
     num_rounds: int = 20,
     local_epochs: int = 2,
     lr: float = 1e-3,
