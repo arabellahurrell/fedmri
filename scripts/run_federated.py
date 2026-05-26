@@ -69,20 +69,21 @@ def main():
         device=device,
     )
 
-    val_metrics = evaluate_model(global_model, val_loader, domain, device)
-    print(f"Final — SSIM: {val_metrics['ssim']:.4f} | PSNR: {val_metrics['psnr']:.2f} dB")
-
     ckpt_path = f"{args.save_dir}/{args.model}_{args.partition}.pt"
     torch.save({
         "model_type": args.model,
         "domain": domain,
         "partition": args.partition,
         "model_state_dict": global_model.state_dict(),
-        "val_metrics": val_metrics,
         "args": vars(args),
     }, ckpt_path)
     print(f"Checkpoint: {ckpt_path}")
 
+    global_model = global_model.to(device)
+    val_metrics = evaluate_model(global_model, val_loader, domain, device)
+
+    print(f"Final — SSIM: {val_metrics['ssim']:.4f} | PSNR: {val_metrics['psnr']:.2f} dB")
+    
     tracker = ResultsTracker(save_dir=args.results_dir)
     tracker.log(
         model=args.model,
