@@ -2,6 +2,7 @@
 import copy
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
+import os
 
 import numpy as np
 import torch
@@ -213,6 +214,7 @@ def run_simulation(
     device: Optional[torch.device] = None,
     model_kwargs: Optional[dict] = None,
     checkpoint_dir: Optional[str] = None,
+    resume_round: Optional[int] = None,
 ) -> Tuple[nn.Module, object]:
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     domain = MODEL_DOMAINS[model_type]
@@ -220,7 +222,17 @@ def run_simulation(
     client_ids = list(train_loaders.keys())
     num_clients = len(train_loaders)
     global_model = make_model(model_type, model_kwargs)
-
+    if resume_round is not None and checkpoint_dir is not None:
+        ckpt_path = os.path.join(
+            checkpoint_dir,
+            f"{model_type}_scanner_round{resume_round:02d}.pt"
+        )
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            global_model.load_state_dict(ckpt["model_state_dict"])
+            print(f"Resumed from round {resume_round}: {ckpt_path}")
+        else:
+            print(f"WARNING: checkpoint not found at {ckpt_path}, starting from scratch")
     def client_fn(cid: str) -> FedMRIClient:
         idx = client_ids[int(cid)]
         return FedMRIClient(

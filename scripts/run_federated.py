@@ -29,6 +29,7 @@ def parse_args():
     p.add_argument("--results_dir", default="results/federated")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed",       type=int, default=42)
+    p.add_argument("--resume_round", type=int, default=None)
     return p.parse_args()
 
 
@@ -68,6 +69,7 @@ def main():
         adversary=adversary,
         device=device,
         checkpoint_dir=args.save_dir,
+        resume_round=args.resume_round,
     )
 
     ckpt_path = f"{args.save_dir}/{args.model}_{args.partition}.pt"
