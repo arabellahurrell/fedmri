@@ -67,6 +67,7 @@ def main():
         lr=args.lr,
         adversary=adversary,
         device=device,
+        checkpoint_dir=args.save_dir,
     )
 
     ckpt_path = f"{args.save_dir}/{args.model}_{args.partition}.pt"
@@ -83,7 +84,7 @@ def main():
     val_metrics = evaluate_model(global_model, val_loader, domain, device)
 
     print(f"Final — SSIM: {val_metrics['ssim']:.4f} | PSNR: {val_metrics['psnr']:.2f} dB")
-    
+
     tracker = ResultsTracker(save_dir=args.results_dir)
     tracker.log(
         model=args.model,

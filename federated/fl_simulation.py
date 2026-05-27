@@ -164,6 +164,13 @@ class FedMRIClient(fl.client.NumPyClient):
 
 
 class FedAvgWithLogging(FedAvg):
+    def __init__(self, *args, checkpoint_dir=None, model_type=None, model_kwargs=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.checkpoint_dir = checkpoint_dir
+        self.model_type = model_type
+        self.model_kwargs = model_kwargs or {}
+        self._latest_params = None
+
     def aggregate_fit(self, server_round, results, failures):
         aggregated_params, aggregated_metrics = super().aggregate_fit(
             server_round, results, failures
@@ -171,6 +178,27 @@ class FedAvgWithLogging(FedAvg):
         if results:
             avg_loss = np.mean([r.metrics.get("train_loss", 0.0) for _, r in results])
             print(f"[Round {server_round}] avg train loss: {avg_loss:.4f}")
+        
+        if aggregated_params is not None:
+            self._latest_params = aggregated_params
+            # Save per-round checkpoint
+            if self.checkpoint_dir and self.model_type:
+                import os
+                os.makedirs(self.checkpoint_dir, exist_ok=True)
+                ndarrays = parameters_to_ndarrays(aggregated_params)
+                model = make_model(self.model_type, self.model_kwargs)
+                set_parameters(model, ndarrays)
+                ckpt_path = os.path.join(
+                    self.checkpoint_dir,
+                    f"{self.model_type}_scanner_round{server_round:02d}.pt"
+                )
+                torch.save({
+                    "model_type": self.model_type,
+                    "round": server_round,
+                    "model_state_dict": model.state_dict(),
+                }, ckpt_path)
+                print(f"  Saved checkpoint: {ckpt_path}")
+
         return aggregated_params, aggregated_metrics
 
 
@@ -184,6 +212,7 @@ def run_simulation(
     adversary: Optional[Adversary] = None,
     device: Optional[torch.device] = None,
     model_kwargs: Optional[dict] = None,
+    checkpoint_dir: Optional[str] = None,
 ) -> Tuple[nn.Module, object]:
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     domain = MODEL_DOMAINS[model_type]
@@ -211,6 +240,9 @@ def run_simulation(
         min_evaluate_clients=num_clients,
         min_available_clients=num_clients,
         initial_parameters=ndarrays_to_parameters(get_parameters(global_model)),
+        checkpoint_dir=checkpoint_dir,
+        model_type=model_type,
+        model_kwargs=model_kwargs
     )
 
     history = fl.simulation.start_simulation(
@@ -218,7 +250,12 @@ def run_simulation(
         num_clients=num_clients,
         config=fl.server.ServerConfig(num_rounds=num_rounds),
         strategy=strategy,
-        client_resources={"num_gpus": 1.0 / num_clients},
+        client_resources={"num_gpus": 1.0, "num_cpus": 1},
     )
+
+    if strategy._latest_params is not None:
+        final_ndarrays = parameters_to_ndarrays(strategy._latest_params)
+        set_parameters(global_model, final_ndarrays)
+        print("Final weights applied to global model.")
 
     return global_model, history

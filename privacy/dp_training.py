@@ -139,11 +139,15 @@ class DPFedMRIClient:
             device=self.device,
         )
 
+    def set_total_epochs(self, num_fl_rounds: int) -> None:
+        self.dp_trainer.epochs = num_fl_rounds * self.local_epochs
+
+    def setup(self) -> None:
+        self.dp_trainer.setup()
+
     def fit(self, parameters, config):
         from federated.fl_simulation import set_parameters, get_parameters
         set_parameters(self.dp_trainer.get_model(), parameters)
-
-        self.dp_trainer.setup()  
 
         for _ in range(self.local_epochs):
             self.dp_trainer.train_epoch(self.domain)
