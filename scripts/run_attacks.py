@@ -88,6 +88,9 @@ def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
     all_ssim, all_psnr, all_lpips = [], [], []
     recon_gallery = []
 
+    from tqdm import tqdm
+    pbar = tqdm(total=args.gi_batches, desc=f"GIA [{model_type}]")
+
     for i, batch in enumerate(loader):
         if i >= args.gi_batches:
             break
@@ -103,9 +106,11 @@ def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
             all_ssim.append(m.get("ssim", float("nan")))
             all_psnr.append(m.get("psnr", float("nan")))
             all_lpips.append(m.get("lpips", float("nan")))
+        pbar.update(1)
         if i < 3:
             recon_gallery.append((batch["image_target"][0].cpu().numpy(), recon[0].detach().cpu(), m))
 
+    pbar.close()
     if recon_gallery:
         fig, axes = plt.subplots(len(recon_gallery), 2, figsize=(6, 3 * len(recon_gallery)))
         if len(recon_gallery) == 1:
@@ -181,9 +186,9 @@ def main():
         domain = ckpt.get("domain", MODEL_DOMAINS[model_type])
 
         train_ds = FastMRISliceDataset(root=args.data_root, domain=domain, split="train",
-                                       acceleration=args.acceleration, seed=args.seed)
+                                       acceleration=args.acceleration, seed=args.seed, cache_dir=args.data_root,)
         val_ds   = FastMRISliceDataset(root=args.data_root, domain=domain, split="val",
-                                       acceleration=args.acceleration, seed=args.seed)
+                                       acceleration=args.acceleration, seed=args.seed, cache_dir=args.data_root,)
 
         gia_metrics = run_gia(model, model_type, domain, train_ds, args, device, args.results_dir)
         mia_metrics = run_mia(model, domain, train_ds, val_ds, args, device)
@@ -199,6 +204,6 @@ def main():
         plot_comparison(all_results, args.results_dir)
 
     print("\nAttack benchmarking complete.")
-    
+
 if __name__ == "__main__":
     main()

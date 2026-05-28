@@ -155,14 +155,19 @@ class TVGradientInversion:
 
         best_recon = None
         best_loss = float("inf")
+        from tqdm import tqdm
 
-        for _ in range(self.restarts):
+        for restart in range(self.restarts):
             dummy = torch.randn(input_shape, device=self.device, requires_grad=True)
             optim = torch.optim.Adam([dummy], lr=self.lr)
             from models.unet import ReconstructionLoss
             loss_fn = ReconstructionLoss()
+
+            pbar = tqdm(range(self.num_iters),
+                        desc=f"  Restart {restart+1}/{self.restarts}",
+                        leave=False)
             
-            for it in range(self.num_iters):
+            for it in pbar:
                 optim.zero_grad()
 
                 if self.domain == "image":
@@ -194,6 +199,7 @@ class TVGradientInversion:
                 total = grad_loss + self.tv_weight * tv
                 total.backward()
                 optim.step()
+                pbar.set_postfix({"loss": f"{total.item():.4f}"})
 
                 with torch.no_grad():
                     dummy.clamp_(-1.5, 1.5)
