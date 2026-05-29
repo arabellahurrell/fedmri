@@ -46,15 +46,14 @@ def parse_args():
     return p.parse_args()
 
 
-def simulate_weight_delta(model, batch, domain, device, lr=1e-3):
+def simulate_client_gradients(model, batch, domain, device):
     import copy
     model_copy = copy.deepcopy(model)
     # model_copy.load_state_dict(model.state_dict())
     model_copy.to(device).train()
 
     loss_fn = ReconstructionLoss()
-    optim = torch.optim.Adam(model_copy.parameters(), lr=lr)
-    optim.zero_grad()
+    model_copy.zero_grad(set_to_none=True)
 
     if domain == "image":
         pred = model_copy(batch["image_input"].to(device)).squeeze(1)
@@ -69,9 +68,13 @@ def simulate_weight_delta(model, batch, domain, device, lr=1e-3):
             pred = model_copy(k).squeeze(1)
 
     loss_fn(pred, y).backward()
-    return [p.grad.detach().cpu().numpy()
-            for p in model_copy.parameters() if p.grad is not None]
-
+    grads = []
+    for p in model_copy.parameters():
+        if p.grad is None:
+            grads.append(np.zeros(tuple(p.shape), dtype=np.float32))
+        else:
+            grads.append(p.grad.detach().cpu().numpy())
+    return grads
 
 def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
     loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=0,
@@ -94,14 +97,20 @@ def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
     for i, batch in enumerate(loader):
         if i >= args.gi_batches:
             break
-        weight_delta = simulate_weight_delta(model, batch, domain, device)
+        grads = simulate_client_gradients(model, batch, domain, device)
         input_key = "image_input" if domain == "image" else "kspace"
-        recon, m = attacker.run(
-            weight_delta=weight_delta,
-            input_shape=tuple(batch[input_key].shape),
-            lr_client=1e-3,
-            ground_truth=batch[input_key],
-        )
+        if args.use_breaching:
+            recon, m = attacker.run(
+                true_gradients=grads,
+                ground_truth_batch=batch,
+                batch_size=1,
+            )
+        else:
+            recon, m = attacker.run(
+                true_gradients=grads,
+                input_shape=tuple(batch[input_key].shape),
+                ground_truth=batch[input_key],
+            )
         if m:
             all_ssim.append(m.get("ssim", float("nan")))
             all_psnr.append(m.get("psnr", float("nan")))
@@ -139,7 +148,7 @@ def run_mia(model, domain, train_ds, val_ds, args, device):
     n = min(args.mia_samples, len(train_ds), len(val_ds))
     member_loader    = DataLoader(Subset(train_ds, list(range(n))), batch_size=args.batch_size)
     nonmember_loader = DataLoader(Subset(val_ds,   list(range(n))), batch_size=args.batch_size)
-    return LossThresholdMIA().evaluate(model, member_loader, nonmember_loader, domain, device)
+    return LossThresholdMIA().evaluate(model, member_loader, nonmember_loader, domain, device, seed=args.seed)
 
 
 def plot_comparison(all_results, results_dir):

@@ -74,28 +74,9 @@ class LossThresholdMIA:
             raise ValueError("Call calibrate() first or set threshold manually.")
         return (losses < self.threshold).astype(int)
 
-    def evaluate(
-        self,
-        model: nn.Module,
-        member_loader: DataLoader,
-        nonmember_loader: DataLoader,
-        domain: str,
-        device: torch.device,
-    ) -> Dict[str, float]:
-        member_losses = compute_per_sample_loss(model, member_loader, domain, device)
-        nonmember_losses = compute_per_sample_loss(model, nonmember_loader, domain, device)
-
-        self.calibrate(member_losses, nonmember_losses)
-
-        all_losses = np.concatenate([member_losses, nonmember_losses])
-        labels = np.concatenate([
-            np.ones(len(member_losses)),
-            np.zeros(len(nonmember_losses)),
-        ])
-        preds = self.predict(all_losses)
-
-        # AUC (using loss as score; lower loss → higher member probability → negate)
-        auc = roc_auc_score(labels, -all_losses)
+    def _metrics(self, losses: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
+        preds = self.predict(losses)
+        auc = roc_auc_score(labels, -losses)
         acc = accuracy_score(labels, preds)
         tp = np.sum((preds == 1) & (labels == 1))
         fp = np.sum((preds == 1) & (labels == 0))
@@ -109,10 +90,53 @@ class LossThresholdMIA:
             "tpr": float(tpr),
             "fpr": float(fpr),
             "advantage": float(advantage),
+        }
+    
+    def evaluate(
+        self,
+        model: nn.Module,
+        member_loader: DataLoader,
+        nonmember_loader: DataLoader,
+        domain: str,
+        device: torch.device,
+        calibration_split: float = 0.5,
+        seed: int = 42,
+    ) -> Dict[str, float]:
+        member_losses = compute_per_sample_loss(model, member_loader, domain, device)
+        nonmember_losses = compute_per_sample_loss(model, nonmember_loader, domain, device)
+
+        rng = np.random.RandomState(seed)
+
+        def split(arr: np.ndarray):
+            idx = rng.permutation(len(arr))
+            k = int(round(len(arr) * calibration_split))
+            k = min(max(k, 1), len(arr) - 1) if len(arr) >= 2 else len(arr)
+            return arr[idx[:k]], arr[idx[k:]]
+
+        mem_cal, mem_eval = split(member_losses)
+        non_cal, non_eval = split(nonmember_losses)
+
+        if len(mem_eval) == 0 or len(non_eval) == 0:
+            mem_cal, mem_eval = member_losses, member_losses
+            non_cal, non_eval = nonmember_losses, nonmember_losses
+
+        self.calibrate(mem_cal, non_cal)
+
+        eval_losses = np.concatenate([mem_eval, non_eval])
+        eval_labels = np.concatenate([
+            np.ones(len(mem_eval)),
+            np.zeros(len(non_eval)),
+        ])
+
+        out = self._metrics(eval_losses, eval_labels)
+        out.update({
             "threshold": float(self.threshold),
+            "n_calibration": int(len(mem_cal) + len(non_cal)),
+            "n_eval": int(len(eval_labels)),
             "member_loss_mean": float(member_losses.mean()),
             "nonmember_loss_mean": float(nonmember_losses.mean()),
-        }
+        })
+        return out
 
 
 class ShadowModelMIA:

@@ -1,4 +1,5 @@
 import copy
+from multiprocessing import dummy
 import torch
 import torch.nn as nn
 import numpy as np
@@ -48,8 +49,7 @@ class GradientInversionAttack:
 
     def run(
         self,
-        weight_delta: list,
-        lr: float = 1e-3,
+        true_gradients: list,
         ground_truth_batch: Optional[dict] = None,
         batch_size: int = 1,
     ) -> Tuple[torch.Tensor, dict]:
@@ -60,10 +60,10 @@ class GradientInversionAttack:
                 "breaching is not installed. Run: bash scripts/setup_breaching.sh"
             )
 
-        gradients = weight_deltas_to_gradients(self.model, weight_delta, lr)
+        # gradients = weight_deltas_to_gradients(self.model, weight_delta, lr)
         grad_tensors = [
             torch.tensor(g, dtype=p.dtype, device=self.device)
-            for g, p in zip(gradients, self.model.parameters())
+            for g, p in zip(true_gradients, self.model.parameters())
         ]
 
         # Set up breaching config
@@ -143,48 +143,57 @@ class TVGradientInversion:
 
     def run(
         self,
-        weight_delta: list,
+        true_gradients: list,
         input_shape: Tuple,
-        lr_client: float = 1e-3,
         ground_truth: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         true_grads = [
-            torch.tensor(g / lr_client, device=self.device, dtype=torch.float32)
-            for g in weight_delta
+            torch.tensor(g, device=self.device, dtype=torch.float32)
+            for g in true_gradients
         ]
 
         best_recon = None
         best_loss = float("inf")
         from tqdm import tqdm
+        from models.unet import ReconstructionLoss
+        loss_fn = ReconstructionLoss()
 
         for restart in range(self.restarts):
             dummy = torch.randn(input_shape, device=self.device, requires_grad=True)
-            optim = torch.optim.Adam([dummy], lr=self.lr)
-            from models.unet import ReconstructionLoss
-            loss_fn = ReconstructionLoss()
+
+            if self.domain == "image":
+                mask = None
+                with torch.no_grad():
+                        probe = self.model(dummy)
+            else:
+                B, _, H, W = input_shape
+                mask = torch.ones(B, 1, 1, W, device=self.device, dtype=torch.bool)
+                with torch.no_grad():
+                    probe = self.model(dummy, mask)
+
+                
+            dummy_target = torch.zeros_like(probe, requires_grad=True)
+            optim = torch.optim.Adam([dummy, dummy_target], lr=self.lr)
 
             pbar = tqdm(range(self.num_iters),
-                        desc=f"  Restart {restart+1}/{self.restarts}",
-                        leave=False)
-            
+                    desc=f"  Restart {restart+1}/{self.restarts}",
+                    leave=False)
+                
+            total = torch.tensor(float("inf"))
             for it in pbar:
                 optim.zero_grad()
 
                 if self.domain == "image":
                     dummy_out = self.model(dummy)
                 else:
-                    B, _, H, W = input_shape
-                    mask = torch.ones(B, 1, 1, W, device=self.device, dtype=torch.bool)
                     dummy_out = self.model(dummy, mask)
 
-                
-                dummy_target = torch.zeros_like(dummy_out)
                 dummy_loss = loss_fn(dummy_out.squeeze(1), dummy_target.squeeze(1))
                 dummy_grads = torch.autograd.grad(
                     dummy_loss, self.model.parameters(), create_graph=True, allow_unused=True
                 )
                 dummy_grads = [g if g is not None else torch.zeros_like(p) 
-                            for g, p in zip(dummy_grads, self.model.parameters())]
+                                for g, p in zip(dummy_grads, self.model.parameters())]
 
                 grad_loss = sum(
                     ((dg - tg) ** 2).sum()
@@ -203,6 +212,7 @@ class TVGradientInversion:
 
                 with torch.no_grad():
                     dummy.clamp_(-1.5, 1.5)
+                    dummy_target.clamp_(min=0.0)
 
             loss_val = total.item()
             if loss_val < best_loss:
