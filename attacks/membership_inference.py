@@ -20,6 +20,7 @@ def compute_per_sample_loss(
         loss_fn = ReconstructionLoss()
 
     model.eval()
+    uses_mask = domain != "image" and model.__class__.__name__ != "KSpaceUNet"
     all_losses = []
 
     for batch in loader:
@@ -27,6 +28,11 @@ def compute_per_sample_loss(
             x = batch["image_input"].to(device)
             y = batch["image_target"].to(device)
             pred = model(x).squeeze(1)
+        elif uses_mask:
+            k = batch["kspace"].to(device)
+            mask = batch["mask"].to(device)
+            y = batch["image_target"].to(device)
+            pred = model(k, mask).squeeze(1)
         else:
             k = batch["kspace"].to(device)
             mask = batch["mask"].to(device)

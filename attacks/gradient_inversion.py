@@ -146,11 +146,29 @@ class TVGradientInversion:
         true_gradients: list,
         input_shape: Tuple,
         ground_truth: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         true_grads = [
             torch.tensor(g, device=self.device, dtype=torch.float32)
             for g in true_gradients
         ]
+        uses_mask = self.domain != "image" and self.model.__class__.__name__ != "KSpaceUNet"
+
+        if uses_mask:
+            if mask is not None:
+                fwd_mask = mask.to(self.device)
+            else:
+                B, _, _, W = input_shape
+                fwd_mask = torch.ones(B, 1, 1, W, device=self.device, dtype=torch.bool)
+        else:
+            fwd_mask = None
+        
+        def forward(x):
+            if self.domain == "image":
+                return self.model(x)
+            if uses_mask:
+                return self.model(x, fwd_mask)
+            return self.model(x)
 
         best_recon = None
         best_loss = float("inf")
@@ -160,18 +178,20 @@ class TVGradientInversion:
 
         for restart in range(self.restarts):
             dummy = torch.randn(input_shape, device=self.device, requires_grad=True)
+            with torch.no_grad():
+                probe = forward(dummy)
 
-            if self.domain == "image":
-                mask = None
-                with torch.no_grad():
-                        probe = self.model(dummy)
-            else:
-                B, _, H, W = input_shape
-                mask = torch.ones(B, 1, 1, W, device=self.device, dtype=torch.bool)
-                with torch.no_grad():
-                    probe = self.model(dummy, mask)
+            # if self.domain == "image":
+            #     mask = None
+            #     with torch.no_grad():
+            #             probe = self.model(dummy)
+            # else:
+            #     B, _, H, W = input_shape
+            #     mask = torch.ones(B, 1, 1, W, device=self.device, dtype=torch.bool)
+            #     with torch.no_grad():
+                    # probe = self.model(dummy, mask)
 
-                
+            
             dummy_target = torch.zeros_like(probe, requires_grad=True)
             optim = torch.optim.Adam([dummy, dummy_target], lr=self.lr)
 
@@ -183,11 +203,7 @@ class TVGradientInversion:
             for it in pbar:
                 optim.zero_grad()
 
-                if self.domain == "image":
-                    dummy_out = self.model(dummy)
-                else:
-                    dummy_out = self.model(dummy, mask)
-
+                dummy_out = forward(dummy)
                 dummy_loss = loss_fn(dummy_out.squeeze(1), dummy_target.squeeze(1))
                 dummy_grads = torch.autograd.grad(
                     dummy_loss, self.model.parameters(), create_graph=True, allow_unused=True

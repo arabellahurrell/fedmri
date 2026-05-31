@@ -76,6 +76,18 @@ def simulate_client_gradients(model, batch, domain, device):
             grads.append(p.grad.detach().cpu().numpy())
     return grads
 
+def recon_to_display(rc, domain):
+    import fastmri
+    r = rc if rc.dim() == 4 else rc.unsqueeze(0)        # (1, C, H, W)
+    if r.shape[1] >= 2:
+        if domain == "kspace":
+            k = r[:, :2].permute(0, 2, 3, 1).contiguous().unsqueeze(1)  # (1,1,H,W,2)
+            mag = fastmri.complex_abs(fastmri.ifft2c(k)).squeeze(1)     # (1,H,W)
+        else:
+            mag = torch.sqrt(r[:, 0] ** 2 + r[:, 1] ** 2)              # (1,H,W)
+        return mag[0].numpy()
+    return r.squeeze().numpy()
+
 def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
     loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=0,
                         generator=torch.Generator().manual_seed(args.seed))
@@ -110,6 +122,7 @@ def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
                 true_gradients=grads,
                 input_shape=tuple(batch[input_key].shape),
                 ground_truth=batch[input_key],
+                mask=batch.get("mask"),
             )
         if m:
             all_ssim.append(m.get("ssim", float("nan")))
@@ -125,7 +138,7 @@ def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
         if len(recon_gallery) == 1:
             axes = [axes]
         for row, (gt, rc, m) in enumerate(recon_gallery):
-            r_img = rc[0].numpy() if rc.shape[0] > 1 else rc.squeeze().numpy()
+            r_img = recon_to_display(rc, domain)
             axes[row][0].imshow(gt, cmap="gray"); axes[row][0].set_title("GT"); axes[row][0].axis("off")
             ssim_s = f"{m.get('ssim', 0):.3f}" if m else "N/A"
             axes[row][1].imshow(r_img, cmap="gray"); axes[row][1].set_title(f"GIA SSIM={ssim_s}"); axes[row][1].axis("off")
@@ -146,8 +159,8 @@ def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
 
 def run_mia(model, domain, train_ds, val_ds, args, device):
     n = min(args.mia_samples, len(train_ds), len(val_ds))
-    member_loader    = DataLoader(Subset(train_ds, list(range(n))), batch_size=args.batch_size)
-    nonmember_loader = DataLoader(Subset(val_ds,   list(range(n))), batch_size=args.batch_size)
+    member_loader    = DataLoader(Subset(train_ds, list(range(n))), batch_size=1)
+    nonmember_loader = DataLoader(Subset(val_ds,   list(range(n))), batch_size=1)
     return LossThresholdMIA().evaluate(model, member_loader, nonmember_loader, domain, device, seed=args.seed)
 
 
@@ -207,6 +220,7 @@ def main():
         entry.update({f"mia_{k}": v for k, v in mia_metrics.items()})
         tracker.log(**entry)
         all_results.append({"model_type": model_type, "gia": gia_metrics, "mia": mia_metrics})
+        tracker.save_csv("attack_results.csv")
 
     tracker.save_csv("attack_results.csv")
     if len(all_results) > 1:
