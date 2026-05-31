@@ -43,6 +43,8 @@ def parse_args():
     p.add_argument("--gi_restarts",  type=int, default=3)
     p.add_argument("--mia_samples",  type=int, default=500)
     p.add_argument("--seed",         type=int, default=42)
+    p.add_argument("--attacks", nargs="+", choices=["gia", "mia"],
+               default=["gia", "mia"])
     return p.parse_args()
 
 
@@ -209,21 +211,39 @@ def main():
 
         train_ds = FastMRISliceDataset(root=args.data_root, domain=domain, split="train",
                                        acceleration=args.acceleration, seed=args.seed, cache_dir=args.data_root,)
-        val_ds   = FastMRISliceDataset(root=args.data_root, domain=domain, split="val",
-                                       acceleration=args.acceleration, seed=args.seed, cache_dir=args.data_root,)
-
-        gia_metrics = run_gia(model, model_type, domain, train_ds, args, device, args.results_dir)
-        mia_metrics = run_mia(model, domain, train_ds, val_ds, args, device)
-
+        val_ds = None
+        if "mia" in args.attacks:
+            val_ds = FastMRISliceDataset(root=args.data_root, domain=domain, split="val",
+                                         acceleration=args.acceleration, seed=args.seed, cache_dir=args.data_root,)
         entry = {"model_type": model_type, "domain": domain, "checkpoint": os.path.basename(ckpt_path)}
-        entry.update({f"gia_{k}": v for k, v in gia_metrics.items()})
-        entry.update({f"mia_{k}": v for k, v in mia_metrics.items()})
+        gia_metrics = mia_metrics = None
+        # val_ds   = FastMRISliceDataset(root=args.data_root, domain=domain, split="val",
+        #                                acceleration=args.acceleration, seed=args.seed, cache_dir=args.data_root,)
+
+        # gia_metrics = run_gia(model, model_type, domain, train_ds, args, device, args.results_dir)
+        # mia_metrics = run_mia(model, domain, train_ds, val_ds, args, device)
+
+        if "gia" in args.attacks:
+            gia_metrics = run_gia(model, model_type, domain, train_ds, args, device, args.results_dir)
+            entry.update({f"gia_{k}": v for k, v in gia_metrics.items()})
+        if "mia" in args.attacks:
+            mia_metrics = run_mia(model, domain, train_ds, val_ds, args, device)
+            entry.update({f"mia_{k}": v for k, v in mia_metrics.items()})
         tracker.log(**entry)
         all_results.append({"model_type": model_type, "gia": gia_metrics, "mia": mia_metrics})
-        tracker.save_csv("attack_results.csv")
+        tracker.save_csv(f"attack_results_{'_'.join(args.attacks)}.csv")
 
-    tracker.save_csv("attack_results.csv")
-    if len(all_results) > 1:
+        # entry = {"model_type": model_type, "domain": domain, "checkpoint": os.path.basename(ckpt_path)}
+        # entry.update({f"gia_{k}": v for k, v in gia_metrics.items()})
+        # entry.update({f"mia_{k}": v for k, v in mia_metrics.items()})
+        # tracker.log(**entry)
+        # all_results.append({"model_type": model_type, "gia": gia_metrics, "mia": mia_metrics})
+        # tracker.save_csv("attack_results.csv")
+
+    tracker.save_csv(f"attack_results_{'_'.join(args.attacks)}.csv")
+    # if len(all_results) > 1:
+    #     plot_comparison(all_results, args.results_dir)
+    if len(all_results) > 1 and all(r["gia"] and r["mia"] for r in all_results):
         plot_comparison(all_results, args.results_dir)
 
     print("\nAttack benchmarking complete.")
