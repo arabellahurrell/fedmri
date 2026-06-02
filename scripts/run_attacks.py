@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 
@@ -101,16 +102,37 @@ def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
             model=model, domain=domain, device=device,
             num_iters=args.gi_iters, restarts=args.gi_restarts,
         )
+    progress_path = os.path.join(results_dir, f"gia_progress_{model_type}.jsonl")
+    gallery_dir = os.path.join(results_dir, f"gia_gallery_cache_{model_type}")
+    os.makedirs(gallery_dir, exist_ok=True)
+    done = {}
+    if os.path.exists(progress_path):
+        with open(progress_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                done[int(rec["batch_idx"])] = rec
+        if done:
+            print(f"  [resume] {model_type}: {len(done)} batches already done, skipping them")
 
-    all_ssim, all_psnr, all_lpips = [], [], []
-    recon_gallery = []
+    all_ssim, all_psnr, all_lpips, all_loss = [], [], [], []
+    for idx in sorted(done):
+        rec = done[idx]
+        all_ssim.append(rec.get("ssim", float("nan")))
+        all_psnr.append(rec.get("psnr", float("nan")))
+        all_lpips.append(rec.get("lpips", float("nan")))
+        all_loss.append(rec.get("final_loss", float("nan")))
 
     from tqdm import tqdm
-    pbar = tqdm(total=args.gi_batches, desc=f"GIA [{model_type}]")
+    pbar = (tqdm(total=args.gi_batches, desc=f"GIA [{model_type}]", initial=len(done)) if args.use_breaching else None)
 
     for i, batch in enumerate(loader):
         if i >= args.gi_batches:
             break
+        if i in done:
+            continue
         grads = simulate_client_gradients(model, batch, domain, device)
         input_key = "image_input" if domain == "image" else "kspace"
         if args.use_breaching:
@@ -119,7 +141,9 @@ def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
                 ground_truth_batch=batch,
                 batch_size=1,
             )
+            pbar.update(1)
         else:
+            print(f"\nbatch {i+1}/{args.gi_batches}")
             recon, m = attacker.run(
                 true_gradients=grads,
                 input_shape=tuple(batch[input_key].shape),
@@ -130,19 +154,38 @@ def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
             all_ssim.append(m.get("ssim", float("nan")))
             all_psnr.append(m.get("psnr", float("nan")))
             all_lpips.append(m.get("lpips", float("nan")))
-        pbar.update(1)
+            all_loss.append(m.get("final_loss", float("nan")))
         if i < 3:
-            recon_gallery.append((batch["image_target"][0].cpu().numpy(), recon[0].detach().cpu(), m))
+            np.savez(
+                os.path.join(gallery_dir, f"batch_{i:03d}.npz"),
+                gt=batch["image_target"][0].cpu().numpy(),
+                recon=recon[0].detach().cpu().numpy(),
+                ssim=np.float32(m.get("ssim", float("nan")) if m else float("nan")),
+            )
+        with open(progress_path, "a") as f:
+            f.write(json.dumps({"batch_idx": i, **(m or {})}) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
-    pbar.close()
-    if recon_gallery:
-        fig, axes = plt.subplots(len(recon_gallery), 2, figsize=(6, 3 * len(recon_gallery)))
-        if len(recon_gallery) == 1:
+    if pbar is not None:
+        pbar.close()
+
+    gallery_files = sorted(
+        p for p in os.listdir(gallery_dir)
+        if p.startswith("batch_") and p.endswith(".npz")
+    )[:3]
+    if gallery_files:
+        fig, axes = plt.subplots(len(gallery_files), 2, figsize=(6, 3 * len(gallery_files)))
+        if len(gallery_files) == 1:
             axes = [axes]
-        for row, (gt, rc, m) in enumerate(recon_gallery):
+        for row, fname in enumerate(gallery_files):
+            data = np.load(os.path.join(gallery_dir, fname))
+            gt = data["gt"]
+            rc = torch.from_numpy(data["recon"])
+            ssim_val = float(data["ssim"])
             r_img = recon_to_display(rc, domain)
             axes[row][0].imshow(gt, cmap="gray"); axes[row][0].set_title("GT"); axes[row][0].axis("off")
-            ssim_s = f"{m.get('ssim', 0):.3f}" if m else "N/A"
+            ssim_s = f"{ssim_val:.3f}" if not np.isnan(ssim_val) else "N/A"
             axes[row][1].imshow(r_img, cmap="gray"); axes[row][1].set_title(f"GIA SSIM={ssim_s}"); axes[row][1].axis("off")
         plt.suptitle(f"{model_type} ({domain}) — GIA Gallery")
         plt.tight_layout()
@@ -155,6 +198,7 @@ def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
         "ssim_mean": nanmean(all_ssim), "ssim_std": nanstd(all_ssim),
         "psnr_mean": nanmean(all_psnr), "psnr_std": nanstd(all_psnr),
         "lpips_mean": nanmean(all_lpips), "lpips_std": nanstd(all_lpips),
+        "final_loss_mean": nanmean(all_loss), "loss_std": nanstd(all_loss),
         "n_batches": len(all_ssim),
     }
 

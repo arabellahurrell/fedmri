@@ -172,6 +172,7 @@ class TVGradientInversion:
 
         best_recon = None
         best_loss = float("inf")
+        restart_losses = []
         from tqdm import tqdm
         from models.unet import ReconstructionLoss
         loss_fn = ReconstructionLoss()
@@ -197,7 +198,7 @@ class TVGradientInversion:
 
             pbar = tqdm(range(self.num_iters),
                     desc=f"  Restart {restart+1}/{self.restarts}",
-                    leave=False)
+                    leave=True)
                 
             total = torch.tensor(float("inf"))
             for it in pbar:
@@ -224,13 +225,19 @@ class TVGradientInversion:
                 total = grad_loss + self.tv_weight * tv
                 total.backward()
                 optim.step()
-                pbar.set_postfix({"loss": f"{total.item():.4f}"})
 
                 with torch.no_grad():
                     dummy.clamp_(-1.5, 1.5)
                     dummy_target.clamp_(min=0.0)
+                
+                if it % 25 == 0:
+                    pbar.set_postfix(loss=f"{total.item():.2f}")
+            
+            pbar.set_postfix(loss=f"{total.item():.2f}")
+            pbar.close()
 
             loss_val = total.item()
+            restart_losses.append(loss_val)
             if loss_val < best_loss:
                 best_loss = loss_val
                 best_recon = dummy.detach().clone()
@@ -248,5 +255,7 @@ class TVGradientInversion:
                     best_recon[:, 0],
                     gt[:, 0] if gt.shape[1] > 1 else gt.squeeze(1),
                 )
+        metrics["final_loss"] = best_loss
+        metrics["restart_losses"] = restart_losses
 
         return best_recon, metrics

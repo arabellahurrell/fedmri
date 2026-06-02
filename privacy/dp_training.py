@@ -67,6 +67,9 @@ class DPTrainer:
         self._dp_loader = dp_loader
         self._privacy_engine = privacy_engine
         self._is_setup = True
+        print(f"  DP setup: ε={self.target_epsilon}, δ={self.target_delta}, "
+              f"C={self.max_grad_norm}, σ={dp_optimizer.noise_multiplier:.3f}")
+
 
     def train_epoch(self, domain: str) -> float:
         if not self._is_setup:
