@@ -15,21 +15,21 @@ except ImportError:
     _lpips_fn = None
     _LPIPS_AVAILABLE = False
 
-    def _lpips_batch(pred_np: np.ndarray, target_np: np.ndarray, device: torch.device) -> float:
-        if not _LPIPS_AVAILABLE:
-            return float("nan")
+def _lpips_batch(pred_np: np.ndarray, target_np: np.ndarray, device: torch.device) -> float:
+    if not _LPIPS_AVAILABLE:
+        return float("nan")
 
-        def to_rgb(arr):
-            t = torch.from_numpy(arr).float()
-            t = t.unsqueeze(1).expand(-1, 3, -1, -1)
-            return t * 2.0 - 1.0
+    def to_rgb(arr):
+        t = torch.from_numpy(arr).float()
+        t = t.unsqueeze(1).expand(-1, 3, -1, -1)
+        return t * 2.0 - 1.0
 
-        p = to_rgb(pred_np).to(device)
-        t = to_rgb(target_np).to(device)
-        fn = _lpips_fn.to(device)
-        with torch.no_grad():
-            scores = fn(p, t)
-        return float(scores.mean().item())
+    p = to_rgb(pred_np).to(device)
+    t = to_rgb(target_np).to(device)
+    fn = _lpips_fn.to(device)
+    with torch.no_grad():
+        scores = fn(p, t)
+    return float(scores.mean().item())
 
 def compute_metrics(
     pred: torch.Tensor,
