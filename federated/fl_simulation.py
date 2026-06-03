@@ -258,7 +258,7 @@ class DPFlowerClient(fl.client.NumPyClient):
         return pred.squeeze(1), y
 
 class FedAvgWithLogging(FedAvg):
-    def __init__(self, *args, checkpoint_dir=None, model_type=None, model_kwargs=None, **kwargs, dp=False):
+    def __init__(self, *args, checkpoint_dir=None, model_type=None, model_kwargs=None, dp=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.checkpoint_dir = checkpoint_dir
         self.model_type = model_type
