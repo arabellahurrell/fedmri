@@ -288,7 +288,7 @@ class FedAvgWithLogging(FedAvg):
                 set_parameters(model, ndarrays)
                 ckpt_path = os.path.join(
                     self.checkpoint_dir,
-                    f"{self.model_type}_scanner_round{server_round:02d}.pt"
+                    f"{self.model_type}_scanner_round{server_round:02d}_eps{self.target_epsilon}.pt"
                 )
                 torch.save({
                     "model_type": self.model_type,
