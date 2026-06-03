@@ -21,13 +21,22 @@ from models.unet import UNet, ReconstructionLoss
 from models.modfed import ModFed
 from models.kspace_unet import KSpaceUNet
 from evaluation.metrics import compute_metrics
-
+from privacy.dp_training import DPTrainer, make_dp_compatible
 
 MODEL_DOMAINS = {
     "unet":   "image",
     "modfed": "kspace",
     "kspace_unet": "kspace",
 }
+
+def _import_dp():
+    try:
+        from federated.dp_training import DPTrainer, make_dp_compatible
+    except ImportError as e:
+        raise ImportError(
+            "Could not import DPTrainer"
+        ) from e
+    return DPTrainer, make_dp_compatible
 
 
 def make_model(model_type: str, model_kwargs: Optional[dict] = None) -> nn.Module:
@@ -163,13 +172,98 @@ class FedMRIClient(fl.client.NumPyClient):
         n = max(len(self.val_loader), 1)
         return total_loss / n, {"ssim": float(np.mean(all_ssim)), "psnr": float(np.mean(all_psnr))}
 
+class DPFlowerClient(fl.client.NumPyClient):
+    def __init__(
+        self,
+        client_id: str,
+        model: nn.Module,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        domain: str,
+        num_rounds: int,
+        dp_config: dict,
+        local_epochs: int = 2,
+        lr: float = 1e-3,
+        device: Optional[torch.device] = None,
+    ):
+        DPTrainer, _ = _import_dp()
+        self.client_id = client_id
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.domain = domain
+        self.local_epochs = local_epochs
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.loss_fn = ReconstructionLoss()
+        # epochs = full horizon so Opacus calibrates sigma for the entire run
+        self.dp_trainer = DPTrainer(
+            model=model,
+            train_loader=train_loader,
+            target_epsilon=dp_config["target_epsilon"],
+            target_delta=dp_config["target_delta"],
+            max_grad_norm=dp_config["max_grad_norm"],
+            lr=lr,
+            epochs=num_rounds * local_epochs,
+            device=self.device,
+        )
+        self._is_setup = False
+
+    def get_parameters(self, config):
+        return get_parameters(self.dp_trainer.get_model())
+
+    def fit(self, parameters, config):
+        set_parameters(self.dp_trainer.get_model(), parameters)
+        if not self._is_setup:
+            self.dp_trainer.setup()
+            self._is_setup = True
+            # reload incoming weights into the freshly Opacus-wrapped module
+            set_parameters(self.dp_trainer.get_model(), parameters)
+        losses = [self.dp_trainer.train_epoch(self.domain) for _ in range(self.local_epochs)]
+        eps = self.dp_trainer.get_epsilon()  # per-round, NOT cumulative
+        params_after = get_parameters(self.dp_trainer.get_model())
+        n = len(self.train_loader.dataset)
+        return params_after, n, {
+            "train_loss": float(np.mean(losses)),
+            "train_epsilon_round": float(eps),
+        }
+
+    def evaluate(self, parameters, config):
+        model = self.dp_trainer.get_model()
+        set_parameters(model, parameters)
+        model.eval()
+        total_loss, all_ssim, all_psnr = 0.0, [], []
+        with torch.no_grad():
+            for batch in self.val_loader:
+                pred, y = self._eval_forward(model, batch)
+                total_loss += self.loss_fn(pred, y).item()
+                m = compute_metrics(pred, y)
+                all_ssim.append(m["ssim"])
+                all_psnr.append(m["psnr"])
+        n = max(len(self.val_loader), 1)
+        return (total_loss / n, len(self.val_loader.dataset),
+                {"ssim": float(np.mean(all_ssim)), "psnr": float(np.mean(all_psnr))})
+
+    def _eval_forward(self, model, batch):
+        if self.domain == "image":
+            x = batch["image_input"].to(self.device)
+            y = batch["image_target"].to(self.device)
+            pred = model(x)
+        else:
+            k = batch["kspace"].to(self.device)
+            y = batch["image_target"].to(self.device)
+            try:
+                mask = batch["mask"].to(self.device)
+                pred = model(k, mask)
+            except (TypeError, KeyError):
+                pred = model(k)
+        return pred.squeeze(1), y
 
 class FedAvgWithLogging(FedAvg):
-    def __init__(self, *args, checkpoint_dir=None, model_type=None, model_kwargs=None, **kwargs):
+    def __init__(self, *args, checkpoint_dir=None, model_type=None, model_kwargs=None, **kwargs, dp=False):
         super().__init__(*args, **kwargs)
         self.checkpoint_dir = checkpoint_dir
         self.model_type = model_type
         self.model_kwargs = model_kwargs or {}
+        self.dp = dp
         self._latest_params = None
 
     def aggregate_fit(self, server_round, results, failures):
@@ -188,6 +282,9 @@ class FedAvgWithLogging(FedAvg):
                 os.makedirs(self.checkpoint_dir, exist_ok=True)
                 ndarrays = parameters_to_ndarrays(aggregated_params)
                 model = make_model(self.model_type, self.model_kwargs)
+                if self.dp:
+                    _, make_dp_compatible = _import_dp()
+                    model = make_dp_compatible(model)
                 set_parameters(model, ndarrays)
                 ckpt_path = os.path.join(
                     self.checkpoint_dir,
@@ -215,6 +312,7 @@ def run_simulation(
     model_kwargs: Optional[dict] = None,
     checkpoint_dir: Optional[str] = None,
     resume_round: Optional[int] = None,
+    dp_config: Optional[dict] = None,
 ) -> Tuple[nn.Module, object]:
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     domain = MODEL_DOMAINS[model_type]
@@ -222,6 +320,9 @@ def run_simulation(
     client_ids = list(train_loaders.keys())
     num_clients = len(train_loaders)
     global_model = make_model(model_type, model_kwargs)
+    if dp_config is not None:
+        _, make_dp_compatible = _import_dp()
+        global_model = make_dp_compatible(global_model)
     if resume_round is not None and checkpoint_dir is not None:
         ckpt_path = os.path.join(
             checkpoint_dir,
@@ -233,8 +334,21 @@ def run_simulation(
             print(f"Resumed from round {resume_round}: {ckpt_path}")
         else:
             print(f"WARNING: checkpoint not found at {ckpt_path}, starting from scratch")
-    def client_fn(cid: str) -> FedMRIClient:
+    def client_fn(cid: str) -> fl.client.NumPyClient:
         idx = client_ids[int(cid)]
+        if dp_config is not None:
+            return DPFlowerClient(
+                client_id=idx,
+                model=make_model(model_type, model_kwargs),
+                train_loader=train_loaders[idx],
+                val_loader=val_loader,
+                domain=domain,
+                num_rounds=num_rounds,
+                dp_config=dp_config,
+                local_epochs=local_epochs,
+                lr=lr,
+                device=device,
+            )
         return FedMRIClient(
             client_id=idx,
             model=make_model(model_type, model_kwargs),
@@ -254,7 +368,8 @@ def run_simulation(
         initial_parameters=ndarrays_to_parameters(get_parameters(global_model)),
         checkpoint_dir=checkpoint_dir,
         model_type=model_type,
-        model_kwargs=model_kwargs
+        model_kwargs=model_kwargs,
+        dp=(dp_config is not None),
     )
 
     history = fl.simulation.start_simulation(
