@@ -57,7 +57,7 @@ class DPTrainer:
             dp_model, dp_optimizer, dp_loader = privacy_engine.make_private(
                 module=self.model, optimizer=optimizer, data_loader=self.train_loader,
                 noise_multiplier=self.noise_multiplier, max_grad_norm=self.max_grad_norm,
-                poisson_sampling=self.poisson_sampling,
+                poisson_sampling=self.poisson_sampling, 
             )
         else:
             dp_model, dp_optimizer, dp_loader = privacy_engine.make_private_with_epsilon(
