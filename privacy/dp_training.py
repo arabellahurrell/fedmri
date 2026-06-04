@@ -69,6 +69,12 @@ class DPTrainer:
         self._dp_model = dp_model
         self._dp_optimizer = dp_optimizer
         self._dp_loader = dp_loader
+        _base_collate = self.train_loader.collate_fn          # your pad_to_max
+        def _safe_collate(batch):
+            if len(batch) == 0:
+                return {}
+            return _base_collate(batch)
+        dp_loader.collate_fn = _safe_collate
         self._privacy_engine = privacy_engine
         self._is_setup = True
         print(f"  DP setup: ε={self.target_epsilon}, δ={self.target_delta}, "
@@ -89,6 +95,8 @@ class DPTrainer:
             optimizer=self._dp_optimizer,
         ) as memory_safe_loader:
             for batch in memory_safe_loader:
+                if not batch:
+                    continue
                 self._dp_optimizer.zero_grad()
                 if domain == "image":
                     x = batch["image_input"].to(self.device)

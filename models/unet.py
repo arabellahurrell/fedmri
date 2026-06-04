@@ -107,8 +107,10 @@ def ssim(
     pred: torch.Tensor,
     target: torch.Tensor,
     window_size: int = 7,
-    data_range: float = 1.0,
+    data_range=None,
 ) -> torch.Tensor:
+    if data_range is None:
+        data_range = (target.amax() - target.amin()).clamp_min(1e-6)
 
     C1 = (0.01 * data_range) ** 2
     C2 = (0.03 * data_range) ** 2
@@ -128,8 +130,8 @@ def ssim(
     mu_y2 = mu_y ** 2
     mu_xy = mu_x * mu_y
 
-    sigma_x2 = F.conv2d(pred ** 2, kernel, padding=pad, groups=1) - mu_x2
-    sigma_y2 = F.conv2d(target ** 2, kernel, padding=pad, groups=1) - mu_y2
+    sigma_x2 = (F.conv2d(pred ** 2, kernel, padding=pad, groups=1) - mu_x2).clamp_min(0)
+    sigma_y2 = (F.conv2d(target ** 2, kernel, padding=pad, groups=1) - mu_y2).clamp_min(0)
     sigma_xy = F.conv2d(pred * target, kernel, padding=pad, groups=1) - mu_xy
 
     num = (2 * mu_xy + C1) * (2 * sigma_xy + C2)

@@ -127,7 +127,7 @@ def load_or_build_slice_cache(
             with h5py.File(h5_path, "r") as f:
                 cache[h5_path.stem] = int(f["kspace"].shape[0])
                 rss = f["reconstruction_rss"][()]
-                norm_cache[h5_path.stem] = float(np.percentile(np.abs(rss), 95)) or 1.0
+                norm_cache[h5_path.stem] = max(float(np.percentile(np.abs(rss), 95)), 1e-6)
             meta = extract_volume_metadata(h5_path)
             meta_cache[h5_path.stem] = meta
         except Exception as e:
@@ -318,7 +318,7 @@ def get_client_dataloaders(
     root: str,
     domain: Literal["kspace", "image"] = "image",
     acceleration: int = 4,
-    batch_size: int = 4,
+    batch_size: int = 16,
     partition: Literal["scanner", "acquisition", "iid"] = "scanner",
     num_clients_iid: int = 4,
     num_workers: int = 4,
