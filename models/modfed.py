@@ -39,12 +39,13 @@ class DataConsistency(nn.Module):
         self.soft = soft
         if soft:
             self.lam = nn.Parameter(torch.ones(1))
+            self.lam.requires_grad = False
 
     def forward(
         self,
-        k_predicted: torch.Tensor,  # (B, 2, H, W)
-        k_measured: torch.Tensor,   # (B, 2, H, W)
-        mask: torch.Tensor,         # (B, 1, 1, W) or (B, 1, H, W) bool
+        k_predicted: torch.Tensor,
+        k_measured: torch.Tensor,
+        mask: torch.Tensor,
     ) -> torch.Tensor:
         m = mask.float()
         while m.dim() > k_predicted.dim():
@@ -97,6 +98,15 @@ class ModFedCascade(nn.Module):
         self.image_refine = ImageRefineCNN(image_channels)
 
     def forward(self, kspace, kspace_measured, mask):
+        if kspace.shape[0] == 0:
+            k_refined = self.kspace_cnn(kspace)                 # was missing
+            _ = self.dc(k_refined, kspace_measured, mask)       # no-grad params, fine
+            magnitude = torch.zeros((0, 1, kspace.shape[2], kspace.shape[3]),
+                                    device=kspace.device, dtype=kspace.dtype)
+            magnitude = self.image_refine(magnitude)
+            k_next_2ch = torch.zeros((0, 2, kspace.shape[2], kspace.shape[3]),
+                                     device=kspace.device, dtype=kspace.dtype)
+            return magnitude, k_next_2ch
         k_refined = self.kspace_cnn(kspace)
         k_dc = self.dc(k_refined, kspace_measured, mask)
         k_dc_real = k_dc.permute(0, 2, 3, 1).contiguous().unsqueeze(1)

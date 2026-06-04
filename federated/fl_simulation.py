@@ -20,7 +20,7 @@ from flwr.server.client_proxy import ClientProxy
 from models.unet import UNet, ReconstructionLoss
 from models.modfed import ModFed
 from models.kspace_unet import KSpaceUNet
-from evaluation.metrics import compute_metrics
+from evaluation.metrics import compute_metrics, evaluate_model
 from privacy.dp_training import DPTrainer, make_dp_compatible
 
 MODEL_DOMAINS = {
@@ -31,7 +31,7 @@ MODEL_DOMAINS = {
 
 def _import_dp():
     try:
-        from federated.dp_training import DPTrainer, make_dp_compatible
+        from privacy.dp_training import DPTrainer, make_dp_compatible
     except ImportError as e:
         raise ImportError(
             "Could not import DPTrainer"
@@ -258,47 +258,70 @@ class DPFlowerClient(fl.client.NumPyClient):
         return pred.squeeze(1), y
 
 class FedAvgWithLogging(FedAvg):
-    def __init__(self, *args, checkpoint_dir=None, model_type=None, model_kwargs=None, dp=False, **kwargs):
+    def __init__(self, *args, checkpoint_dir=None, model_type=None, model_kwargs=None,
+                 dp=False, target_epsilon="inf", eval_loader=None, eval_domain=None,
+                 eval_device=None, metrics_csv=None, round_offset=0, **kwargs):
         super().__init__(*args, **kwargs)
         self.checkpoint_dir = checkpoint_dir
         self.model_type = model_type
         self.model_kwargs = model_kwargs or {}
         self.dp = dp
+        self.target_epsilon = target_epsilon          # <-- fixes the AttributeError crash
+        self.eval_loader = eval_loader
+        self.eval_domain = eval_domain
+        self.eval_device = eval_device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.metrics_csv = metrics_csv
+        self.round_offset = round_offset               # for resume numbering
         self._latest_params = None
 
     def aggregate_fit(self, server_round, results, failures):
-        aggregated_params, aggregated_metrics = super().aggregate_fit(
-            server_round, results, failures
-        )
+        aggregated_params, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
+
+        round_train_eps = None
         if results:
             avg_loss = np.mean([r.metrics.get("train_loss", 0.0) for _, r in results])
             print(f"[Round {server_round}] avg train loss: {avg_loss:.4f}")
-        
+            eps_vals = [r.metrics["train_epsilon_round"] for _, r in results
+                        if "train_epsilon_round" in r.metrics]
+            round_train_eps = float(np.mean(eps_vals)) if eps_vals else None
+
         if aggregated_params is not None:
             self._latest_params = aggregated_params
-            # Save per-round checkpoint
+            actual_round = server_round + self.round_offset
+
+            ndarrays = parameters_to_ndarrays(aggregated_params)
+            model = make_model(self.model_type, self.model_kwargs)
+            if self.dp:
+                _, make_dp_compatible = _import_dp()
+                model = make_dp_compatible(model)
+            set_parameters(model, ndarrays)
+
             if self.checkpoint_dir and self.model_type:
-                import os
                 os.makedirs(self.checkpoint_dir, exist_ok=True)
-                ndarrays = parameters_to_ndarrays(aggregated_params)
-                model = make_model(self.model_type, self.model_kwargs)
-                if self.dp:
-                    _, make_dp_compatible = _import_dp()
-                    model = make_dp_compatible(model)
-                set_parameters(model, ndarrays)
                 ckpt_path = os.path.join(
                     self.checkpoint_dir,
-                    f"{self.model_type}_scanner_round{server_round:02d}_eps{self.target_epsilon}.pt"
+                    f"{self.model_type}_scanner_round{actual_round:02d}_eps{self.target_epsilon}.pt"
                 )
-                torch.save({
-                    "model_type": self.model_type,
-                    "round": server_round,
-                    "model_state_dict": model.state_dict(),
-                }, ckpt_path)
+                torch.save({"model_type": self.model_type, "round": actual_round,
+                            "target_epsilon": self.target_epsilon,
+                            "model_state_dict": model.state_dict()}, ckpt_path)
                 print(f"  Saved checkpoint: {ckpt_path}")
 
-        return aggregated_params, aggregated_metrics
+            if self.eval_loader is not None and self.metrics_csv is not None:
+                model.to(self.eval_device)
+                m = evaluate_model(model, self.eval_loader, self.eval_domain,
+                                   self.eval_device, compute_lpips=False)  # skip per-round LPIPS
+                row = {"model": self.model_type, "target_epsilon": self.target_epsilon,
+                       "round": actual_round, "round_train_epsilon": round_train_eps,
+                       "loss": m["loss"], "ssim": m["ssim"], "psnr": m["psnr"], "nmse": m["nmse"]}
+                os.makedirs(os.path.dirname(self.metrics_csv), exist_ok=True)
+                import pandas as pd
+                pd.DataFrame([row]).to_csv(self.metrics_csv, mode="a", index=False,
+                                           header=not os.path.exists(self.metrics_csv))
+                print(f"  [eval r{actual_round:02d} eps{self.target_epsilon}] "
+                      f"SSIM={m['ssim']:.4f} PSNR={m['psnr']:.2f} NMSE={m['nmse']:.6f}")
 
+        return aggregated_params, aggregated_metrics
 
 def run_simulation(
     model_type: str,
@@ -313,6 +336,8 @@ def run_simulation(
     checkpoint_dir: Optional[str] = None,
     resume_round: Optional[int] = None,
     dp_config: Optional[dict] = None,
+    eval_loader = None,
+    metrics_csv = None,
 ) -> Tuple[nn.Module, object]:
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     domain = MODEL_DOMAINS[model_type]
@@ -323,17 +348,38 @@ def run_simulation(
     if dp_config is not None:
         _, make_dp_compatible = _import_dp()
         global_model = make_dp_compatible(global_model)
-    if resume_round is not None and checkpoint_dir is not None:
-        ckpt_path = os.path.join(
-            checkpoint_dir,
-            f"{model_type}_scanner_round{resume_round:02d}.pt"
-        )
-        if os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location="cpu")
-            global_model.load_state_dict(ckpt["model_state_dict"])
-            print(f"Resumed from round {resume_round}: {ckpt_path}")
-        else:
-            print(f"WARNING: checkpoint not found at {ckpt_path}, starting from scratch")
+    # if resume_round is not None and checkpoint_dir is not None:
+    #     ckpt_path = os.path.join(
+    #         checkpoint_dir,
+    #         f"{model_type}_scanner_round{resume_round:02d}.pt"
+    #     )
+    #     if os.path.exists(ckpt_path):
+    #         ckpt = torch.load(ckpt_path, map_location="cpu")
+    #         global_model.load_state_dict(ckpt["model_state_dict"])
+    #         print(f"Resumed from round {resume_round}: {ckpt_path}")
+    #     else:
+    #         print(f"WARNING: checkpoint not found at {ckpt_path}, starting from scratch")
+    tag = dp_config["target_epsilon"] if dp_config else "inf"
+
+    # auto-resume: find the latest per-round checkpoint for this (model, eps)
+    start_round = 0
+    if checkpoint_dir and os.path.isdir(checkpoint_dir):
+        import glob, re as _re
+        found = []
+        for p in glob.glob(os.path.join(checkpoint_dir, f"{model_type}_scanner_round*_eps{tag}.pt")):
+            mt = _re.search(r"round(\d+)_eps", os.path.basename(p))
+            if mt:
+                found.append((int(mt.group(1)), p))
+        if found:
+            start_round, latest = max(found, key=lambda t: t[0])
+            global_model.load_state_dict(torch.load(latest, map_location="cpu")["model_state_dict"])
+            print(f"Resuming {model_type} eps{tag} from round {start_round}")
+
+    remaining = num_rounds - start_round
+    if remaining <= 0:
+        print(f"{model_type} eps{tag}: already complete ({start_round}/{num_rounds}).")
+        return global_model, None
+
     def client_fn(cid: str) -> fl.client.NumPyClient:
         idx = client_ids[int(cid)]
         if dp_config is not None:
@@ -362,20 +408,18 @@ def run_simulation(
         )
 
     strategy = FedAvgWithLogging(
-        min_fit_clients=num_clients,
-        min_evaluate_clients=num_clients,
+        min_fit_clients=num_clients, min_evaluate_clients=num_clients,
         min_available_clients=num_clients,
         initial_parameters=ndarrays_to_parameters(get_parameters(global_model)),
-        checkpoint_dir=checkpoint_dir,
-        model_type=model_type,
-        model_kwargs=model_kwargs,
-        dp=(dp_config is not None),
+        checkpoint_dir=checkpoint_dir, model_type=model_type, model_kwargs=model_kwargs,
+        dp=(dp_config is not None), target_epsilon=tag,
+        eval_loader=eval_loader, eval_domain=domain, eval_device=device,
+        metrics_csv=metrics_csv, round_offset=start_round,
     )
-
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=num_clients,
-        config=fl.server.ServerConfig(num_rounds=num_rounds),
+        config=fl.server.ServerConfig(num_rounds=remaining),
         strategy=strategy,
         client_resources={"num_gpus": 1.0, "num_cpus": 1},
     )

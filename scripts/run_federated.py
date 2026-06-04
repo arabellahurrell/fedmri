@@ -51,12 +51,6 @@ def eps_tag(eps: float) -> str:
 
 
 def make_dp_config(eps: float, args) -> dict:
-    """dp_config consumed by run_simulation. None == non-private (the eps=inf
-    anchor / utility ceiling): no clipping, no noise, plain client. Otherwise the
-    simulation must build DPFedMRIClient(target_epsilon, target_delta,
-    max_grad_norm), call set_total_epochs(num_rounds) so Opacus calibrates noise
-    to the FULL training length (num_rounds * local_epochs, not one round), then
-    setup()."""
     if math.isinf(eps):
         return None
     return {
@@ -116,6 +110,19 @@ def main():
             cache_dir=args.data_root,
         )
 
+        from torch.utils.data import DataLoader, Subset
+        from data.fastmri_dataset import FastMRISliceDataset
+        eval_ds = FastMRISliceDataset(root=args.data_root, domain=domain, split="val",
+                                    acceleration=args.acceleration, seed=args.seed,
+                                    cache_dir=args.data_root)
+        # subset keeps per-round eval fast; final full-set eval still happens below
+        sub_idx = np.random.RandomState(args.seed).choice(len(eval_ds),
+                    size=min(200, len(eval_ds)), replace=False)
+        eval_loader = DataLoader(Subset(eval_ds, sub_idx), batch_size=1, shuffle=False,
+                                num_workers=args.num_workers)
+        full_eval_loader = DataLoader(eval_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
+        metrics_csv = os.path.join(args.results_dir, f"per_round_metrics_{args.partition}.csv")
+
         for eps in epsilons:
             tag = eps_tag(eps)
             ckpt_path = f"{args.save_dir}/{model_type}_{args.partition}_eps{tag}.pt"
@@ -141,6 +148,8 @@ def main():
                     checkpoint_dir=args.save_dir,
                     resume_round=args.resume_round,
                     dp_config=dp_config,
+                    eval_loader=eval_loader,
+                    metrics_csv=metrics_csv,
                 )
                 model = global_model.to(device)
                 achieved_eps = None
@@ -157,7 +166,7 @@ def main():
                     "args": vars(args),
                 }, ckpt_path)
                 print(f"  checkpoint: {ckpt_path}")
-            val_metrics = evaluate_model(model, val_loader, domain, device)
+            val_metrics = evaluate_model(model, full_eval_loader, domain, device)
             print(f"  eps={tag} -> SSIM {val_metrics['ssim']:.4f} | "
                   f"PSNR {val_metrics['psnr']:.2f} dB")
 

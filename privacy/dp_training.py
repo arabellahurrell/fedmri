@@ -32,6 +32,7 @@ class DPTrainer:
         epochs: int = 10,
         device: Optional[torch.device] = None,
         max_physical_batch_size: int = 8,
+        poisson_sampling: bool = True,
     ):
         self.device = device or torch.device("cpu")
         self.model = make_dp_compatible(model).to(self.device)
@@ -43,6 +44,7 @@ class DPTrainer:
         self.lr = lr
         self.epochs = epochs
         self.max_physical_batch_size = max_physical_batch_size
+        self.poisson_sampling = poisson_sampling
         self._dp_model = None
         self._dp_optimizer = None
         self._privacy_engine = None
@@ -55,12 +57,14 @@ class DPTrainer:
             dp_model, dp_optimizer, dp_loader = privacy_engine.make_private(
                 module=self.model, optimizer=optimizer, data_loader=self.train_loader,
                 noise_multiplier=self.noise_multiplier, max_grad_norm=self.max_grad_norm,
+                poisson_sampling=self.poisson_sampling,
             )
         else:
             dp_model, dp_optimizer, dp_loader = privacy_engine.make_private_with_epsilon(
                 module=self.model, optimizer=optimizer, data_loader=self.train_loader,
                 epochs=self.epochs, target_epsilon=self.target_epsilon,
                 target_delta=self.target_delta, max_grad_norm=self.max_grad_norm,
+                poisson_sampling=self.poisson_sampling,
             )
         self._dp_model = dp_model
         self._dp_optimizer = dp_optimizer
@@ -97,6 +101,10 @@ class DPTrainer:
                     pred = self._dp_model(k, mask).squeeze(1)
                 loss = loss_fn(pred, y)
                 loss.backward()
+                missing = [n for n, p in self._dp_model.named_parameters()
+                   if p.requires_grad and getattr(p, "grad_sample", None) is None]
+                if missing:
+                    print(f"[DP-DEBUG] {len(missing)} params with no grad_sample, e.g. {missing[:8]}")
                 self._dp_optimizer.step()
                 total_loss += loss.item()
                 n_batches += 1
@@ -134,12 +142,14 @@ class DPFedMRIClient:
         self.domain = domain
         self.local_epochs = local_epochs
         self.device = device or torch.device("cpu")
+        use_poisson = (self.domain == "image")
         self.dp_trainer = DPTrainer(
             model=model, train_loader=train_loader,
             target_epsilon=target_epsilon, target_delta=target_delta,
             max_grad_norm=max_grad_norm, lr=lr,
             epochs=local_epochs,
             device=self.device,
+            poisson_sampling=use_poisson,
         )
 
     def set_total_epochs(self, num_fl_rounds: int) -> None:

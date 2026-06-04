@@ -35,6 +35,7 @@ def compute_metrics(
     pred: torch.Tensor,
     target: torch.Tensor,
     data_range: float = 1.0,
+    compute_lpips: bool = True,
 ) -> Dict[str, float]:
     pred_np = pred.detach().cpu().float().numpy()
     target_np = target.detach().cpu().float().numpy()
@@ -62,11 +63,15 @@ def compute_metrics(
         target_norm_batch.append(t_n)
 
     device = pred.device if isinstance(pred, torch.Tensor) else torch.device("cpu")
-    lpips_score = _lpips_batch(
-        np.stack(pred_norm_batch),
-        np.stack(target_norm_batch),
-        device,
-    )
+    
+    if compute_lpips:
+        lpips_score = _lpips_batch(
+            np.stack(pred_norm_batch),
+            np.stack(target_norm_batch),
+            device,
+        )
+    else:
+        lpips_score = float("nan")
 
     return {
         "ssim": float(np.mean(ssim_scores)),
@@ -82,6 +87,7 @@ def evaluate_model(
     loader: torch.utils.data.DataLoader,
     domain: str,
     device: torch.device,
+    compute_lpips: bool = True,
 ) -> Dict[str, float]:
     from models.unet import ReconstructionLoss
     loss_fn = ReconstructionLoss()
@@ -106,7 +112,7 @@ def evaluate_model(
             pred = model(k).squeeze(1)
 
         all_loss.append(loss_fn(pred, y).item())
-        m = compute_metrics(pred, y)
+        m = compute_metrics(pred, y, compute_lpips=compute_lpips)
         all_ssim.append(m["ssim"])
         all_psnr.append(m["psnr"])
         all_nmse.append(m["nmse"])

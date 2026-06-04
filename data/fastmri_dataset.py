@@ -26,6 +26,12 @@ import json
 #   hospital_C — Siemens Biograph_mMR
 #   hospital_D — Siemens Prisma_fit
 
+class _TensorsOnly(torch.utils.data.Dataset):
+    def __init__(self, base): self.base = base
+    def __len__(self): return len(self.base)
+    def __getitem__(self, i):
+        return {k: v for k, v in self.base[i].items() if torch.is_tensor(v)}
+
 def center_crop(tensor: torch.Tensor, crop_h: int, crop_w: int) -> torch.Tensor:
     #center crop the last two spatial dims of a tensor.
     h, w = tensor.shape[-2], tensor.shape[-1]
@@ -39,9 +45,16 @@ def pad_to_max(batch):
     result = {}
     for key in keys:
         vals = [item[key] for item in batch]
-        if not isinstance(vals[0], torch.Tensor):
-            result[key] = vals
+        if isinstance(vals[0], str):
             continue
+
+        if not isinstance(vals[0], torch.Tensor):
+            try:
+                result[key] = torch.tensor(vals)
+            except (TypeError, ValueError):
+                continue  # Skip anything else that cannot be converted
+            continue
+
         if vals[0].dim() >= 2:
             max_h = max(v.shape[-2] for v in vals)
             max_w = max(v.shape[-1] for v in vals)
@@ -329,12 +342,9 @@ def get_client_dataloaders(
 
     train_loaders = {
         label: DataLoader(
-            Subset(train_ds, idxs),
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            collate_fn=pad_to_max,
+_TensorsOnly(Subset(train_ds, idxs)),
+            batch_size=batch_size, shuffle=True, num_workers=num_workers,
+            pin_memory=pin_memory, collate_fn=pad_to_max,
         )
         for label, idxs in groups.items()
     }
