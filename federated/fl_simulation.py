@@ -408,7 +408,7 @@ def run_simulation(
         )
 
     strategy = FedAvgWithLogging(
-        min_fit_clients=num_clients, min_evaluate_clients=num_clients,
+        min_fit_clients=num_clients, fraction_evaluate=0.0, min_evaluate_clients=0,
         min_available_clients=num_clients,
         initial_parameters=ndarrays_to_parameters(get_parameters(global_model)),
         checkpoint_dir=checkpoint_dir, model_type=model_type, model_kwargs=model_kwargs,

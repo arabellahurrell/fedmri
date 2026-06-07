@@ -117,7 +117,7 @@ def main():
                                     cache_dir=args.data_root)
         # subset keeps per-round eval fast; final full-set eval still happens below
         sub_idx = np.random.RandomState(args.seed).choice(len(eval_ds),
-                    size=min(200, len(eval_ds)), replace=False)
+                    size=min(100, len(eval_ds)), replace=False)
         eval_loader = DataLoader(Subset(eval_ds, sub_idx), batch_size=1, shuffle=False,
                                 num_workers=args.num_workers)
         full_eval_loader = DataLoader(eval_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)

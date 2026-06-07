@@ -8,6 +8,8 @@ from opacus import PrivacyEngine
 from opacus.utils.batch_memory_manager import BatchMemoryManager
 from opacus.validators import ModuleValidator
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 def make_dp_compatible(model: nn.Module) -> nn.Module:
     errors = ModuleValidator.validate(model, strict=False)
@@ -31,7 +33,7 @@ class DPTrainer:
         lr: float = 1e-3,
         epochs: int = 10,
         device: Optional[torch.device] = None,
-        max_physical_batch_size: int = 8,
+        max_physical_batch_size: int = 4,
         poisson_sampling: bool = True,
     ):
         self.device = device or torch.device("cpu")
@@ -82,6 +84,7 @@ class DPTrainer:
 
 
     def train_epoch(self, domain: str) -> float:
+        print(f"  [{domain}] client training, {len(self._dp_loader.dataset)} samples", flush=True)
         if not self._is_setup:
             raise RuntimeError("Call setup() first.")
         from models.unet import ReconstructionLoss
@@ -109,10 +112,10 @@ class DPTrainer:
                     pred = self._dp_model(k, mask).squeeze(1)
                 loss = loss_fn(pred, y)
                 loss.backward()
-                missing = [n for n, p in self._dp_model.named_parameters()
-                   if p.requires_grad and getattr(p, "grad_sample", None) is None]
-                if missing:
-                    print(f"[DP-DEBUG] {len(missing)} params with no grad_sample, e.g. {missing[:8]}")
+                # missing = [n for n, p in self._dp_model.named_parameters()
+                #    if p.requires_grad and getattr(p, "grad_sample", None) is None]
+                # if missing:
+                #     print(f"[DP-DEBUG] {len(missing)} params with no grad_sample, e.g. {missing[:8]}")
                 self._dp_optimizer.step()
                 total_loss += loss.item()
                 n_batches += 1
