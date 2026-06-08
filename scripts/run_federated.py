@@ -23,7 +23,7 @@ except Exception:
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", nargs="+",
-                   choices=["unet", "modfed"],
+                   choices=["unet", "modfed", "kspace_unet"],
                    default="unet")
     p.add_argument("--partition",  choices=["scanner", "acquisition", "iid"], default="scanner")
     p.add_argument("--data_root",  default="data/fastmri")
