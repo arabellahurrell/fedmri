@@ -107,9 +107,12 @@ class DPTrainer:
                     pred = self._dp_model(x).squeeze(1)
                 else:
                     k = batch["kspace"].to(self.device)
-                    mask = batch["mask"].to(self.device)
                     y = batch["image_target"].to(self.device)
-                    pred = self._dp_model(k, mask).squeeze(1)
+                    try:
+                        mask = batch["mask"].to(self.device)
+                        pred = self._dp_model(k, mask).squeeze(1)
+                    except (TypeError, KeyError):
+                        pred = self._dp_model(k).squeeze(1)
                 loss = loss_fn(pred, y)
                 loss.backward()
                 # missing = [n for n, p in self._dp_model.named_parameters()
