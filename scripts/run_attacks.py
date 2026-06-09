@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -189,7 +190,7 @@ def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
             axes[row][1].imshow(r_img, cmap="gray"); axes[row][1].set_title(f"GIA SSIM={ssim_s}"); axes[row][1].axis("off")
         plt.suptitle(f"{model_type} ({domain}) — GIA Gallery")
         plt.tight_layout()
-        fig.savefig(f"{results_dir}/gia_gallery_{model_type}.png", dpi=150, bbox_inches="tight")
+        fig.savefig(f"{results_dir}/gia_gallery_{model_type}_eps{args.target_epsilon}.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
     nanmean = lambda x: float(np.nanmean(x)) if x else float("nan")
@@ -248,6 +249,9 @@ def main():
         print(f"\n{'='*65}\n  {os.path.basename(ckpt_path)}\n{'='*65}")
         ckpt = torch.load(ckpt_path, map_location=device)
         model_type = ckpt["model_type"]
+        _stem = os.path.splitext(os.path.basename(ckpt_path))[0]
+        _m = re.search(r"eps([0-9p]+)", _stem)
+        args.target_epsilon = _m.group(1) if _m else "NA"
         model = MODEL_CONSTRUCTORS[model_type]()
         model.load_state_dict(ckpt["model_state_dict"])
         model.eval().to(device)
