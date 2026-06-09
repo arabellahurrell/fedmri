@@ -102,8 +102,8 @@ def run_gia(model, model_type, domain, train_ds, args, device, results_dir):
             model=model, domain=domain, device=device,
             num_iters=args.gi_iters, restarts=args.gi_restarts,
         )
-    progress_path = os.path.join(results_dir, f"gia_progress_{model_type}.jsonl")
-    gallery_dir = os.path.join(results_dir, f"gia_gallery_cache_{model_type}")
+    progress_path = os.path.join(results_dir, f"gia_progress_{model_type}_eps{args.target_epsilon}.jsonl")
+    gallery_dir = os.path.join(results_dir, f"gia_gallery_cache_{model_type}_eps{args.target_epsilon}")
     os.makedirs(gallery_dir, exist_ok=True)
     done = {}
     if os.path.exists(progress_path):
