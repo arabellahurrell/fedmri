@@ -254,6 +254,8 @@ def main():
         args.target_epsilon = _m.group(1) if _m else "NA"
         model = MODEL_CONSTRUCTORS[model_type]()
         model.load_state_dict(ckpt["model_state_dict"])
+        for p in model.parameters():
+            p.requires_grad = True
         model.eval().to(device)
         domain = ckpt.get("domain", MODEL_DOMAINS[model_type])
 
