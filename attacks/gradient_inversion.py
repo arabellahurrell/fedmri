@@ -244,17 +244,17 @@ class TVGradientInversion:
 
         metrics = {}
         if ground_truth is not None:
+            import fastmri
             from evaluation.metrics import compute_metrics
             gt = ground_truth.to(self.device)
-            if self.domain == "kspace":
-                best_recon_mag = torch.sqrt(best_recon[:, 0] ** 2 + best_recon[:, 1] ** 2)
-                gt_mag = torch.sqrt(gt[:, 0] ** 2 + gt[:, 1] ** 2)
-                metrics = compute_metrics(best_recon_mag, gt_mag)
-            else:
-                metrics = compute_metrics(
-                    best_recon[:, 0],
-                    gt[:, 0] if gt.shape[1] > 1 else gt.squeeze(1),
-                )
+
+            def to_image(x):                         # x: (B, 2, H, W) real/imag
+                if self.domain == "kspace":
+                    xc = x[:, :2].permute(0, 2, 3, 1).contiguous().unsqueeze(1)  # (B,1,H,W,2)
+                    return fastmri.complex_abs(fastmri.ifft2c(xc)).squeeze(1)     # (B,H,W) image
+                return torch.sqrt(x[:, 0] ** 2 + x[:, 1] ** 2)                    # (B,H,W) magnitude
+
+            metrics = compute_metrics(to_image(best_recon), to_image(gt))
         metrics["final_loss"] = best_loss
         metrics["restart_losses"] = restart_losses
 
