@@ -35,9 +35,8 @@ def compute_per_sample_loss(
             pred = model(k, mask).squeeze(1)
         else:
             k = batch["kspace"].to(device)
-            mask = batch["mask"].to(device)
             y = batch["image_target"].to(device)
-            pred = model(k, mask).squeeze(1)
+            pred = model(k).squeeze(1)
 
         # Compute per-sample (not reduced)
         for i in range(pred.shape[0]):
