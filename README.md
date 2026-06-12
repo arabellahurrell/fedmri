@@ -215,5 +215,5 @@ Generative AI tools were used during development: Claude (Anthropic) assisted wi
 debugging, figure-plotting code, locating library documentation, and sense-checking the
 logic behind the code. All AI-assisted output was reviewed, tested, and verified by the
 author, and no AI-generated content is presented as independent intellectual
-contribution.
+contribution. Generative AI was also used to help create this README. 
 
